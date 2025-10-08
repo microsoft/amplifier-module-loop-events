@@ -1,0 +1,2 @@
+[amplifier.modules]
+loop-events = amplifier_mod_loop_events:mount
