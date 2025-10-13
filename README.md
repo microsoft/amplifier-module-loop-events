@@ -16,9 +16,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Windows
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
+
 ## Purpose
 
 Provides event-driven orchestration that:
+
 - Queries schedulers for tool/agent/context decisions
 - Reduces multiple scheduler responses to single decision
 - Falls back gracefully if no schedulers respond
@@ -28,7 +30,7 @@ Provides event-driven orchestration that:
 
 **Module Type:** Orchestrator
 **Mount Point:** `orchestrator`
-**Entry Point:** `amplifier_mod_loop_events:mount`
+**Entry Point:** `amplifier_module_loop_events:mount`
 
 ## Configuration
 
@@ -52,6 +54,7 @@ config = { cost_weight = 0.6, latency_weight = 0.4 }
 ## Behavior
 
 Standard agent loop with event-driven decision-making:
+
 1. Get user prompt
 2. Loop while tool calls needed:
    - Query schedulers for tool selection via `decision:tool_resolution` event
