@@ -140,7 +140,7 @@ class EventDrivenOrchestrator:
                     continue
                 if hook_result.action == "modify":
                     original_tool = tool_name
-                    tool_name = hook_result.data.get("tool", tool_name)
+                    tool_name = hook_result.data.get("tool", tool_name) if hook_result.data else tool_name
                     logger.info(f"Tool changed by scheduler: {original_tool} → {tool_name}")
 
                 # Emit selection for logging (AFTER decision is made)

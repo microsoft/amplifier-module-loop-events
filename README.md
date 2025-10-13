@@ -2,6 +2,20 @@
 
 Event-driven agent loop orchestrator for Amplifier with scheduler integration.
 
+## Prerequisites
+
+- **Python 3.11+**
+- **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
+
+### Installing UV
+
+```bash
+# macOS/Linux/WSL
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
 ## Purpose
 
 Provides event-driven orchestration that:
