@@ -120,118 +120,149 @@ class EventDrivenOrchestrator:
                 # Trust LLM's selection
                 tool_name = tool_call.tool
 
-                # Optional: Allow schedulers to veto or modify
-                hook_result = await hooks.emit(
-                    "tool:selecting",
-                    {"tool": tool_name, "arguments": tool_call.arguments, "available_tools": list(tools.keys())},
-                )
+                # Track if tool response was added to prevent orphaned tool calls
+                response_added = False
 
-                if hook_result.action == "deny":
-                    logger.info(f"Tool {tool_name} vetoed: {hook_result.reason}")
-                    reason = hook_result.reason or "Tool execution denied by scheduler"
-                    await context.add_message(
-                        {
-                            "role": "tool",
-                            "name": tool_name,
-                            "tool_call_id": tool_call.id,
-                            "content": f"Error: {reason}",
-                        }
-                    )
-                    continue
-                if hook_result.action == "modify":
-                    original_tool = tool_name
-                    tool_name = hook_result.data.get("tool", tool_name) if hook_result.data else tool_name
-                    logger.info(f"Tool changed by scheduler: {original_tool} → {tool_name}")
-
-                # Emit selection for logging (AFTER decision is made)
-                await hooks.emit(
-                    "tool:selected",
-                    {
-                        "tool": tool_name,
-                        "source": "scheduler" if hook_result.action == "modify" else "llm",
-                        "original_tool": tool_call.tool if hook_result.action == "modify" else None,
-                    },
-                )
-
-                # Get tool object first to pass to hook
-                tool = tools.get(tool_name)
-
-                # Pre-tool hook (backward compatibility, now includes tool object for metadata checking)
-                hook_data = {"tool": tool_name, "arguments": tool_call.arguments}
-                if tool:
-                    hook_data["tool_obj"] = tool
-                pre_hook_result = await hooks.emit("tool:pre", hook_data)
-
-                if pre_hook_result.action == "deny":
-                    # Tool denied by hook - MUST add tool_result for API compliance
-                    reason = pre_hook_result.reason or "Tool execution denied"
-                    await context.add_message(
-                        {
-                            "role": "tool",
-                            "name": tool_name,
-                            "tool_call_id": tool_call.id,
-                            "content": f"Error: {reason}",
-                        }
-                    )
-                    continue
-
-                # Check if tool exists (we already got it earlier for the hook)
-                if not tool:
-                    # Tool not found - MUST add tool_result for API compliance
-                    await context.add_message(
-                        {
-                            "role": "tool",
-                            "name": tool_name,
-                            "tool_call_id": tool_call.id,
-                            "content": f"Error: Tool {tool_name} not found",
-                        }
-                    )
-                    # Emit error event
-                    await hooks.emit(
-                        "error:tool",
-                        {
-                            "error_type": "tool_not_found",
-                            "error_message": f"Tool {tool_name} not found",
-                            "severity": "medium",
-                        },
-                    )
-                    continue
-
-                # Execute tool
                 try:
-                    result = await tool.execute(tool_call.arguments)
-                except Exception as e:
-                    logger.error(f"Tool execution error: {e}")
-                    result = ToolResult(success=False, error={"message": str(e)})
-                    # Emit error event
+                    # Optional: Allow schedulers to veto or modify
+                    hook_result = await hooks.emit(
+                        "tool:selecting",
+                        {"tool": tool_name, "arguments": tool_call.arguments, "available_tools": list(tools.keys())},
+                    )
+
+                    if hook_result.action == "deny":
+                        logger.info(f"Tool {tool_name} vetoed: {hook_result.reason}")
+                        reason = hook_result.reason or "Tool execution denied by scheduler"
+                        await context.add_message(
+                            {
+                                "role": "tool",
+                                "name": tool_name,
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {reason}",
+                            }
+                        )
+                        response_added = True
+                        continue
+                    if hook_result.action == "modify":
+                        original_tool = tool_name
+                        tool_name = hook_result.data.get("tool", tool_name) if hook_result.data else tool_name
+                        logger.info(f"Tool changed by scheduler: {original_tool} → {tool_name}")
+
+                    # Emit selection for logging (AFTER decision is made)
                     await hooks.emit(
-                        "error:tool",
+                        "tool:selected",
                         {
-                            "error_type": "execution_failed",
-                            "error_message": str(e),
                             "tool": tool_name,
-                            "severity": "high",
+                            "source": "scheduler" if hook_result.action == "modify" else "llm",
+                            "original_tool": tool_call.tool if hook_result.action == "modify" else None,
                         },
                     )
 
-                # Post-tool hook
-                await hooks.emit(
-                    "tool:post",
-                    {
-                        "tool": tool_name,
-                        "result": result.model_dump() if hasattr(result, "model_dump") else str(result),
-                    },
-                )
+                    # Get tool object first to pass to hook
+                    tool = tools.get(tool_name)
 
-                # Add tool result to context
-                await context.add_message(
-                    {
-                        "role": "tool",
-                        "name": tool_name,
-                        "tool_call_id": tool_call.id,
-                        "content": str(result.output) if result.success else f"Error: {result.error}",
-                    }
-                )
+                    # Pre-tool hook (backward compatibility, now includes tool object for metadata checking)
+                    hook_data = {"tool": tool_name, "arguments": tool_call.arguments}
+                    if tool:
+                        hook_data["tool_obj"] = tool
+                    pre_hook_result = await hooks.emit("tool:pre", hook_data)
+
+                    if pre_hook_result.action == "deny":
+                        # Tool denied by hook - MUST add tool_result for API compliance
+                        reason = pre_hook_result.reason or "Tool execution denied"
+                        await context.add_message(
+                            {
+                                "role": "tool",
+                                "name": tool_name,
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: {reason}",
+                            }
+                        )
+                        response_added = True
+                        continue
+
+                    # Check if tool exists (we already got it earlier for the hook)
+                    if not tool:
+                        # Tool not found - MUST add tool_result for API compliance
+                        await context.add_message(
+                            {
+                                "role": "tool",
+                                "name": tool_name,
+                                "tool_call_id": tool_call.id,
+                                "content": f"Error: Tool {tool_name} not found",
+                            }
+                        )
+                        response_added = True
+                        # Emit error event
+                        await hooks.emit(
+                            "error:tool",
+                            {
+                                "error_type": "tool_not_found",
+                                "error_message": f"Tool {tool_name} not found",
+                                "severity": "medium",
+                            },
+                        )
+                        continue
+
+                    # Execute tool
+                    try:
+                        result = await tool.execute(tool_call.arguments)
+                    except Exception as e:
+                        logger.error(f"Tool execution error: {e}")
+                        result = ToolResult(success=False, error={"message": str(e)})
+                        # Emit error event
+                        await hooks.emit(
+                            "error:tool",
+                            {
+                                "error_type": "execution_failed",
+                                "error_message": str(e),
+                                "tool": tool_name,
+                                "severity": "high",
+                            },
+                        )
+
+                    # Post-tool hook
+                    await hooks.emit(
+                        "tool:post",
+                        {
+                            "tool": tool_name,
+                            "result": result.model_dump() if hasattr(result, "model_dump") else str(result),
+                        },
+                    )
+
+                    # Add tool result to context
+                    await context.add_message(
+                        {
+                            "role": "tool",
+                            "name": tool_name,
+                            "tool_call_id": tool_call.id,
+                            "content": str(result.output) if result.success else f"Error: {result.error}",
+                        }
+                    )
+                    response_added = True
+
+                except Exception as e:
+                    # Safety net: Ensure tool response is ALWAYS added to prevent orphaned tool calls
+                    logger.error(f"Unexpected error executing tool {tool_name}: {e}", exc_info=True)
+
+                    if not response_added:
+                        try:
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "tool_call_id": tool_call.id,
+                                    "content": f"Internal error executing tool: {str(e)}",
+                                }
+                            )
+                        except Exception as inner_e:
+                            # Critical failure: Even adding error response failed
+                            logger.error(
+                                f"Critical: Failed to add error response for tool_call_id {tool_call.id}: {inner_e}"
+                            )
+
+                    # Continue processing remaining tools - don't let one failure stop all tools
+                    continue
 
             # Check if we should compact context
             if await context.should_compact():
