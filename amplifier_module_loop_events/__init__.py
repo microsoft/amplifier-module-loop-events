@@ -10,6 +10,9 @@ from amplifier_core import HookRegistry
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ToolResult
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
+from amplifier_core.events import PROMPT_SUBMIT
+from amplifier_core.events import TOOL_POST
+from amplifier_core.events import TOOL_PRE
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,13 @@ class EventDrivenOrchestrator:
         Returns:
             Final response string
         """
+        # Emit and process prompt submit (allows hooks to inject context before processing)
+        result = await hooks.emit(PROMPT_SUBMIT, {"data": {"prompt": prompt}})
+        if coordinator:
+            result = await coordinator.process_hook_result(result, "prompt:submit", "orchestrator")
+            if result.action == "deny":
+                return f"Operation denied: {result.reason}"
+
         # Emit session start
         await hooks.emit("session:start", {"prompt": prompt})
 
@@ -168,25 +178,33 @@ class EventDrivenOrchestrator:
                     # Get tool object first to pass to hook
                     tool = tools.get(tool_name)
 
-                    # Pre-tool hook (backward compatibility, now includes tool object for metadata checking)
-                    hook_data = {"tool": tool_name, "arguments": tool_call.arguments}
-                    if tool:
-                        hook_data["tool_obj"] = tool
-                    pre_hook_result = await hooks.emit("tool:pre", hook_data)
-
-                    if pre_hook_result.action == "deny":
-                        # Tool denied by hook - MUST add tool_result for API compliance
-                        reason = pre_hook_result.reason or "Tool execution denied"
-                        await context.add_message(
-                            {
-                                "role": "tool",
-                                "name": tool_name,
-                                "tool_call_id": tool_call.id,
-                                "content": f"Error: {reason}",
+                    # Pre-tool hook
+                    pre_result = await hooks.emit(
+                        TOOL_PRE,
+                        {
+                            "data": {
+                                "tool_name": tool_name,
+                                "tool": tool_name,
+                                "tool_input": tool_call.arguments,
+                                "args": tool_call.arguments,
                             }
-                        )
-                        response_added = True
-                        continue
+                        },
+                    )
+                    if coordinator:
+                        pre_result = await coordinator.process_hook_result(pre_result, "tool:pre", tool_name)
+                        if pre_result.action == "deny":
+                            # Tool denied by hook - MUST add tool_result for API compliance
+                            reason = pre_result.reason or "Tool execution denied"
+                            await context.add_message(
+                                {
+                                    "role": "tool",
+                                    "name": tool_name,
+                                    "tool_call_id": tool_call.id,
+                                    "content": f"Error: {reason}",
+                                }
+                            )
+                            response_added = True
+                            continue
 
                     # Check if tool exists (we already got it earlier for the hook)
                     if not tool:
@@ -228,14 +246,23 @@ class EventDrivenOrchestrator:
                             },
                         )
 
+                    # Serialize result for logging
+                    result_data = result.model_dump() if hasattr(result, "model_dump") else str(result)
+
                     # Post-tool hook
-                    await hooks.emit(
-                        "tool:post",
+                    post_result = await hooks.emit(
+                        TOOL_POST,
                         {
-                            "tool": tool_name,
-                            "result": result.model_dump() if hasattr(result, "model_dump") else str(result),
+                            "data": {
+                                "tool_name": tool_name,
+                                "tool": tool_name,
+                                "tool_input": tool_call.arguments,
+                                "result": result_data,
+                            }
                         },
                     )
+                    if coordinator:
+                        await coordinator.process_hook_result(post_result, "tool:post", tool_name)
 
                     # Add tool result to context
                     await context.add_message(
