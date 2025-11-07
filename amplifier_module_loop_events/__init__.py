@@ -9,6 +9,7 @@ from typing import Any
 from amplifier_core import HookRegistry
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ToolResult
+from amplifier_core.events import ORCHESTRATOR_COMPLETE
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,13 @@ class EventDrivenOrchestrator:
         self.default_provider = config.get("default_provider")
 
     async def execute(
-        self, prompt: str, context, providers: dict[str, Any], tools: dict[str, Any], hooks: HookRegistry
+        self,
+        prompt: str,
+        context,
+        providers: dict[str, Any],
+        tools: dict[str, Any],
+        hooks: HookRegistry,
+        coordinator: ModuleCoordinator | None = None,
     ) -> str:
         """
         Execute the agent loop trusting LLM decisions.
@@ -271,6 +278,18 @@ class EventDrivenOrchestrator:
 
         # Emit session end
         await hooks.emit("session:end", {"response": final_response})
+
+        # Emit orchestrator complete event
+        await hooks.emit(
+            ORCHESTRATOR_COMPLETE,
+            {
+                "data": {
+                    "orchestrator": "loop-events",
+                    "turn_count": iteration,
+                    "status": "success" if final_response else "incomplete",
+                }
+            },
+        )
 
         return final_response
 
