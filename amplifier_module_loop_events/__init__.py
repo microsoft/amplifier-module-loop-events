@@ -144,7 +144,11 @@ class EventDrivenOrchestrator:
                     # Optional: Allow schedulers to veto or modify
                     hook_result = await hooks.emit(
                         "tool:selecting",
-                        {"tool": tool_name, "arguments": tool_call.arguments, "available_tools": list(tools.keys())},
+                        {
+                            "tool_name": tool_name,
+                            "tool_input": tool_call.arguments,
+                            "available_tools": list(tools.keys()),
+                        },
                     )
 
                     if hook_result.action == "deny":
