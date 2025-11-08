@@ -70,7 +70,7 @@ class EventDrivenOrchestrator:
             Final response string
         """
         # Emit and process prompt submit (allows hooks to inject context before processing)
-        result = await hooks.emit(PROMPT_SUBMIT, {"data": {"prompt": prompt}})
+        result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
         if coordinator:
             result = await coordinator.process_hook_result(result, "prompt:submit", "orchestrator")
             if result.action == "deny":
@@ -182,12 +182,8 @@ class EventDrivenOrchestrator:
                     pre_result = await hooks.emit(
                         TOOL_PRE,
                         {
-                            "data": {
-                                "tool_name": tool_name,
-                                "tool": tool_name,
-                                "tool_input": tool_call.arguments,
-                                "args": tool_call.arguments,
-                            }
+                            "tool_name": tool_name,
+                            "tool_input": tool_call.arguments,
                         },
                     )
                     if coordinator:
@@ -253,12 +249,9 @@ class EventDrivenOrchestrator:
                     post_result = await hooks.emit(
                         TOOL_POST,
                         {
-                            "data": {
-                                "tool_name": tool_name,
-                                "tool": tool_name,
-                                "tool_input": tool_call.arguments,
-                                "result": result_data,
-                            }
+                            "tool_name": tool_name,
+                            "tool_input": tool_call.arguments,
+                            "result": result_data,
                         },
                     )
                     if coordinator:
@@ -310,11 +303,9 @@ class EventDrivenOrchestrator:
         await hooks.emit(
             ORCHESTRATOR_COMPLETE,
             {
-                "data": {
-                    "orchestrator": "loop-events",
-                    "turn_count": iteration,
-                    "status": "success" if final_response else "incomplete",
-                }
+                "orchestrator": "loop-events",
+                "turn_count": iteration,
+                "status": "success" if final_response else "incomplete",
             },
         )
 
