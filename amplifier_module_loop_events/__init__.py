@@ -56,8 +56,7 @@ class EventDrivenOrchestrator:
         hooks: HookRegistry,
         coordinator: ModuleCoordinator | None = None,
     ) -> str:
-        """
-        Execute the agent loop trusting LLM decisions.
+        """Execute the agent loop trusting LLM decisions.
 
         Args:
             prompt: User input prompt
@@ -70,11 +69,13 @@ class EventDrivenOrchestrator:
             Final response string
         """
         # Emit and process prompt submit (allows hooks to inject context before processing)
-        result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
+        prompt_submit_result = await hooks.emit(PROMPT_SUBMIT, {"prompt": prompt})
         if coordinator:
-            result = await coordinator.process_hook_result(result, "prompt:submit", "orchestrator")
-            if result.action == "deny":
-                return f"Operation denied: {result.reason}"
+            prompt_submit_result = await coordinator.process_hook_result(
+                prompt_submit_result, "prompt:submit", "orchestrator"
+            )
+            if prompt_submit_result.action == "deny":
+                return f"Operation denied: {prompt_submit_result.reason}"
 
         # Emit session start
         await hooks.emit("session:start", {"prompt": prompt})
@@ -95,6 +96,20 @@ class EventDrivenOrchestrator:
 
             # Get messages from context
             messages = await context.get_messages()
+
+            # Append ephemeral injection from prompt:submit if present (not stored in context)
+            if (
+                prompt_submit_result.action == "inject_context"
+                and prompt_submit_result.ephemeral
+                and prompt_submit_result.context_injection
+            ):
+                messages = list(messages)  # Copy to avoid modifying context
+                messages.append(
+                    {
+                        "role": prompt_submit_result.context_injection_role,
+                        "content": prompt_submit_result.context_injection,
+                    }
+                )
 
             # Get completion from provider
             try:
