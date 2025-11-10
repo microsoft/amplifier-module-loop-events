@@ -44,7 +44,9 @@ class EventDrivenOrchestrator:
     def __init__(self, config: dict[str, Any]):
         """Initialize the orchestrator with configuration."""
         self.config = config
-        self.max_iterations = config.get("max_iterations", 50)
+        # -1 means unlimited iterations (default)
+        max_iter_config = config.get("max_iterations", -1)
+        self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
         self.default_provider = config.get("default_provider")
 
     async def execute(
@@ -91,7 +93,7 @@ class EventDrivenOrchestrator:
         iteration = 0
         final_response = ""
 
-        while iteration < self.max_iterations:
+        while self.max_iterations == -1 or iteration < self.max_iterations:
             iteration += 1
 
             # Get messages from context
@@ -314,6 +316,44 @@ class EventDrivenOrchestrator:
             if await context.should_compact():
                 await hooks.emit("context:pre-compact", {})
                 await context.compact()
+
+        # Check if we exceeded max iterations (only if not unlimited)
+        if self.max_iterations != -1 and iteration >= self.max_iterations and not final_response:
+            logger.warning(f"Max iterations ({self.max_iterations}) reached without final response")
+
+            # Inject system reminder to agent before final response
+            await hooks.emit(
+                "provider:request",
+                {"provider": provider.__class__.__name__, "iteration": iteration, "max_reached": True},
+            )
+
+            # Get one final response with the reminder
+            message_dicts = await context.get_messages()
+            message_dicts = list(message_dicts)
+            message_dicts.append(
+                {
+                    "role": "system",
+                    "content": """<system-reminder>
+You have reached the maximum number of iterations for this turn. Please provide a response to the user now, summarizing your progress and noting what remains to be done. You can continue in the next turn if needed.
+</system-reminder>""",
+                }
+            )
+
+            try:
+                kwargs = {}
+                tools_list = list(tools.values()) if tools else []
+                if tools_list:
+                    kwargs["tools"] = tools_list
+
+                response = await provider.complete(message_dicts, **kwargs)
+                tool_calls = provider.parse_tool_calls(response)
+
+                if not tool_calls:
+                    final_response = response.content
+                    await context.add_message({"role": "assistant", "content": response.content})
+
+            except Exception as e:
+                logger.error(f"Error getting final response after max iterations: {e}")
 
         # Emit session end
         await hooks.emit("session:end", {"response": final_response})
