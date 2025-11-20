@@ -13,6 +13,9 @@ from amplifier_core.events import ORCHESTRATOR_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
+from amplifier_core.message_models import ChatRequest
+from amplifier_core.message_models import Message
+from amplifier_core.message_models import ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +100,8 @@ class EventDrivenOrchestrator:
             iteration += 1
 
             # Get messages from context
-            messages = await context.get_messages()
+            message_dicts = await context.get_messages()
+            message_dicts = list(message_dicts)  # Convert to list for modification
 
             # Append ephemeral injection from prompt:submit if present (not stored in context)
             if (
@@ -105,18 +109,28 @@ class EventDrivenOrchestrator:
                 and prompt_submit_result.ephemeral
                 and prompt_submit_result.context_injection
             ):
-                messages = list(messages)  # Copy to avoid modifying context
-                messages.append(
+                message_dicts.append(
                     {
                         "role": prompt_submit_result.context_injection_role,
                         "content": prompt_submit_result.context_injection,
                     }
                 )
 
+            # Convert dicts to ChatRequest for provider
+            messages_objects = [Message(**msg) for msg in message_dicts]
+
+            # Convert tools to ToolSpec format for ChatRequest
+            tools_list = None
+            if tools:
+                tools_list = [
+                    ToolSpec(name=t.name, description=t.description, parameters=t.input_schema) for t in tools.values()
+                ]
+
+            chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
+
             # Get completion from provider
             try:
-                # Pass tools to provider so LLM can use them
-                response = await provider.complete(messages, tools=list(tools.values()))
+                response = await provider.complete(chat_request)
             except Exception as e:
                 logger.error(f"Provider error: {e}")
                 # Emit error event
@@ -145,14 +159,14 @@ class EventDrivenOrchestrator:
                 {
                     "role": "assistant",
                     "content": response.content if response.content else "",
-                    "tool_calls": [{"tool": tc.tool, "arguments": tc.arguments, "id": tc.id} for tc in tool_calls],
+                    "tool_calls": [{"tool": tc.name, "arguments": tc.arguments, "id": tc.id} for tc in tool_calls],
                 }
             )
 
             # Execute tool calls
             for tool_call in tool_calls:
                 # Trust LLM's selection
-                tool_name = tool_call.tool
+                tool_name = tool_call.name
 
                 # Track if tool response was added to prevent orphaned tool calls
                 response_added = False
@@ -192,7 +206,7 @@ class EventDrivenOrchestrator:
                         {
                             "tool": tool_name,
                             "source": "scheduler" if hook_result.action == "modify" else "llm",
-                            "original_tool": tool_call.tool if hook_result.action == "modify" else None,
+                            "original_tool": tool_call.name if hook_result.action == "modify" else None,
                         },
                     )
 
@@ -340,12 +354,20 @@ You have reached the maximum number of iterations for this turn. Please provide 
             )
 
             try:
-                kwargs = {}
-                tools_list = list(tools.values()) if tools else []
-                if tools_list:
-                    kwargs["tools"] = tools_list
+                # Convert dicts to ChatRequest
+                messages_objects = [Message(**msg) for msg in message_dicts]
 
-                response = await provider.complete(message_dicts, **kwargs)
+                # Convert tools to ToolSpec format for ChatRequest
+                tools_list = None
+                if tools:
+                    tools_list = [
+                        ToolSpec(name=t.name, description=t.description, parameters=t.input_schema)
+                        for t in tools.values()
+                    ]
+
+                max_iter_chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
+
+                response = await provider.complete(max_iter_chat_request)
                 tool_calls = provider.parse_tool_calls(response)
 
                 if not tool_calls:
