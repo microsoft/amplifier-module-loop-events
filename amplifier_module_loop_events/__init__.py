@@ -151,17 +151,44 @@ class EventDrivenOrchestrator:
             if not tool_calls:
                 # No tool calls - we're done
                 final_response = response.content
-                await context.add_message({"role": "assistant", "content": final_response})
+                # Store structured content from response.content (our Pydantic models)
+                response_content = getattr(response, "content", None)
+                if response_content and isinstance(response_content, list):
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": [
+                            block.model_dump() if hasattr(block, "model_dump") else block for block in response_content
+                        ],
+                    }
+                else:
+                    assistant_msg = {"role": "assistant", "content": final_response}
+                # Preserve provider metadata (provider-agnostic passthrough)
+                if hasattr(response, "metadata") and response.metadata:
+                    assistant_msg["metadata"] = response.metadata
+                await context.add_message(assistant_msg)
                 break
 
             # Add assistant message with tool calls to context
-            await context.add_message(
-                {
+            # Store structured content from response.content (our Pydantic models)
+            response_content = getattr(response, "content", None)
+            if response_content and isinstance(response_content, list):
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": [
+                        block.model_dump() if hasattr(block, "model_dump") else block for block in response_content
+                    ],
+                    "tool_calls": [{"tool": tc.name, "arguments": tc.arguments, "id": tc.id} for tc in tool_calls],
+                }
+            else:
+                assistant_msg = {
                     "role": "assistant",
                     "content": response.content if response.content else "",
                     "tool_calls": [{"tool": tc.name, "arguments": tc.arguments, "id": tc.id} for tc in tool_calls],
                 }
-            )
+            # Preserve provider metadata (provider-agnostic passthrough)
+            if hasattr(response, "metadata") and response.metadata:
+                assistant_msg["metadata"] = response.metadata
+            await context.add_message(assistant_msg)
 
             # Execute tool calls
             for tool_call in tool_calls:
