@@ -150,7 +150,18 @@ class EventDrivenOrchestrator:
 
             if not tool_calls:
                 # No tool calls - we're done
-                final_response = response.content
+                # Extract text from content blocks
+                content = response.content
+                if isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if hasattr(block, "text"):
+                            text_parts.append(block.text)
+                        elif isinstance(block, dict) and "text" in block:
+                            text_parts.append(block["text"])
+                    final_response = "\n\n".join(text_parts) if text_parts else ""
+                else:
+                    final_response = content if content else ""
                 # Store structured content from response.content (our Pydantic models)
                 response_content = getattr(response, "content", None)
                 if response_content and isinstance(response_content, list):
@@ -398,7 +409,18 @@ You have reached the maximum number of iterations for this turn. Please provide 
                 tool_calls = provider.parse_tool_calls(response)
 
                 if not tool_calls:
-                    final_response = response.content
+                    # Extract text from content blocks
+                    content = response.content
+                    if isinstance(content, list):
+                        text_parts = []
+                        for block in content:
+                            if hasattr(block, "text"):
+                                text_parts.append(block.text)
+                            elif isinstance(block, dict) and "text" in block:
+                                text_parts.append(block["text"])
+                        final_response = "\n\n".join(text_parts) if text_parts else ""
+                    else:
+                        final_response = content if content else ""
                     await context.add_message({"role": "assistant", "content": response.content})
 
             except Exception as e:
