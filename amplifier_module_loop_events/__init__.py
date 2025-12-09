@@ -3,6 +3,9 @@ Event-driven orchestrator module for Amplifier.
 Trusts LLM decisions with optional scheduler veto/modification.
 """
 
+# Amplifier module metadata
+__amplifier_module_type__ = "orchestrator"
+
 import logging
 from typing import Any
 
