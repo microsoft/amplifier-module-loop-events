@@ -333,13 +333,13 @@ class EventDrivenOrchestrator:
                     if coordinator:
                         await coordinator.process_hook_result(post_result, "tool:post", tool_name)
 
-                    # Add tool result to context
+                    # Add tool result to context (JSON-serialized for dict/list outputs)
                     await context.add_message(
                         {
                             "role": "tool",
                             "name": tool_name,
                             "tool_call_id": tool_call.id,
-                            "content": str(result.output) if result.success else f"Error: {result.error}",
+                            "content": result.get_serialized_output(),
                         }
                     )
                     response_added = True
