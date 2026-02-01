@@ -6,6 +6,7 @@ Trusts LLM decisions with optional scheduler veto/modification.
 # Amplifier module metadata
 __amplifier_module_type__ = "orchestrator"
 
+import asyncio
 import logging
 from typing import Any
 
@@ -102,6 +103,11 @@ class EventDrivenOrchestrator:
         final_response = ""
 
         while self.max_iterations == -1 or iteration < self.max_iterations:
+            # Check for cancellation at iteration start
+            if coordinator and coordinator.cancellation.is_cancelled:
+                # Don't process more iterations, exit gracefully
+                return final_response
+
             iteration += 1
 
             # Get messages for LLM request (context handles compaction internally)
@@ -182,6 +188,16 @@ class EventDrivenOrchestrator:
             # Get completion from provider
             try:
                 response = await provider.complete(chat_request)
+
+                # Check for immediate cancellation after provider returns
+                # This allows force-cancel to take effect as soon as the blocking
+                # provider call completes, before processing the response
+                if coordinator and coordinator.cancellation.is_immediate:
+                    return final_response
+
+            except asyncio.CancelledError:
+                # Task was cancelled - propagate the cancellation
+                raise
             except Exception as e:
                 logger.error(f"Provider error: {e}")
                 # Emit error event
