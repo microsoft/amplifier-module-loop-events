@@ -15,8 +15,10 @@ from amplifier_core import ModuleCoordinator
 from amplifier_core import ToolResult
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
+from amplifier_core.events import PROVIDER_ERROR
 from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
+from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolSpec
@@ -55,6 +57,7 @@ class EventDrivenOrchestrator:
         max_iter_config = config.get("max_iterations", -1)
         self.max_iterations = int(max_iter_config) if max_iter_config != -1 else -1
         self.default_provider = config.get("default_provider")
+        self.extended_thinking = config.get("extended_thinking", False)
         # Store ephemeral injections from tool:post hooks for next iteration
         self._pending_ephemeral_injections: list[dict[str, Any]] = []
 
@@ -183,11 +186,18 @@ class EventDrivenOrchestrator:
                     for t in tools.values()
                 ]
 
-            chat_request = ChatRequest(messages=messages_objects, tools=tools_list)
+            chat_request = ChatRequest(
+                messages=messages_objects,
+                tools=tools_list,
+                reasoning_effort=self.config.get("reasoning_effort"),
+            )
 
             # Get completion from provider
             try:
-                response = await provider.complete(chat_request)
+                kwargs = {}
+                if self.extended_thinking:
+                    kwargs["extended_thinking"] = True
+                response = await provider.complete(chat_request, **kwargs)
 
                 # Check for immediate cancellation after provider returns
                 # This allows force-cancel to take effect as soon as the blocking
@@ -198,11 +208,24 @@ class EventDrivenOrchestrator:
             except asyncio.CancelledError:
                 # Task was cancelled - propagate the cancellation
                 raise
+            except LLMError as e:
+                logger.error(f"Provider error: {e}")
+                await hooks.emit(
+                    PROVIDER_ERROR,
+                    {
+                        "error_type": "completion_failed",
+                        "error_message": str(e),
+                        "severity": "high",
+                        "retryable": e.retryable,
+                        "status_code": e.status_code,
+                    },
+                )
+                final_response = f"Error getting response: {e}"
+                break
             except Exception as e:
                 logger.error(f"Provider error: {e}")
-                # Emit error event
                 await hooks.emit(
-                    "error:provider",
+                    PROVIDER_ERROR,
                     {
                         "error_type": "completion_failed",
                         "error_message": str(e),
@@ -537,10 +560,15 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     ]
 
                 max_iter_chat_request = ChatRequest(
-                    messages=messages_objects, tools=tools_list
+                    messages=messages_objects,
+                    tools=tools_list,
+                    reasoning_effort=self.config.get("reasoning_effort"),
                 )
 
-                response = await provider.complete(max_iter_chat_request)
+                kwargs = {}
+                if self.extended_thinking:
+                    kwargs["extended_thinking"] = True
+                response = await provider.complete(max_iter_chat_request, **kwargs)
                 tool_calls = provider.parse_tool_calls(response)
 
                 if not tool_calls:
@@ -560,8 +588,28 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                         {"role": "assistant", "content": response.content}
                     )
 
+            except LLMError as e:
+                logger.error(f"Error getting final response after max iterations: {e}")
+                await hooks.emit(
+                    PROVIDER_ERROR,
+                    {
+                        "error_type": "completion_failed",
+                        "error_message": str(e),
+                        "severity": "high",
+                        "retryable": e.retryable,
+                        "status_code": e.status_code,
+                    },
+                )
             except Exception as e:
                 logger.error(f"Error getting final response after max iterations: {e}")
+                await hooks.emit(
+                    PROVIDER_ERROR,
+                    {
+                        "error_type": "completion_failed",
+                        "error_message": str(e),
+                        "severity": "high",
+                    },
+                )
 
         # Emit execution end
         await hooks.emit("execution:end", {"response": final_response})
