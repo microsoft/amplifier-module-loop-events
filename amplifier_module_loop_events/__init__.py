@@ -7,6 +7,7 @@ Trusts LLM decisions with optional scheduler veto/modification.
 __amplifier_module_type__ = "orchestrator"
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -467,13 +468,34 @@ class EventDrivenOrchestrator:
                             f"Stored ephemeral injection from tool:post ({tool_name}) for next iteration"
                         )
 
-                    # Add tool result to context (JSON-serialized for dict/list outputs)
+                    # Check if a hook modified the tool result.
+                    # hooks.emit() chains modify actions: when a hook
+                    # returns action="modify", the data dict is replaced.
+                    # We detect this by checking if the returned "result"
+                    # is a different object than what we originally sent.
+                    modified_result = None
+                    if post_result and post_result.data is not None:
+                        returned_result = post_result.data.get("result")
+                        if (
+                            returned_result is not None
+                            and returned_result is not result_data
+                        ):
+                            modified_result = returned_result
+
+                    if modified_result is not None:
+                        if isinstance(modified_result, (dict, list)):
+                            tool_content = json.dumps(modified_result)
+                        else:
+                            tool_content = str(modified_result)
+                    else:
+                        tool_content = result.get_serialized_output()
+
                     await context.add_message(
                         {
                             "role": "tool",
                             "name": tool_name,
                             "tool_call_id": tool_call.id,
-                            "content": result.get_serialized_output(),
+                            "content": tool_content,
                         }
                     )
                     response_added = True
