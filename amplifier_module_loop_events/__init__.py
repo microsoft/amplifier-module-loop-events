@@ -416,7 +416,7 @@ class EventDrivenOrchestrator:
                     # Execute tool
                     try:
                         result = await tool.execute(tool_call.arguments)
-                    except Exception as e:
+                    except (Exception, asyncio.CancelledError) as e:
                         logger.error(f"Tool execution error: {e}")
                         result = ToolResult(success=False, error={"message": str(e)})
                         # Emit error event
@@ -500,7 +500,7 @@ class EventDrivenOrchestrator:
                     )
                     response_added = True
 
-                except Exception as e:
+                except (Exception, asyncio.CancelledError) as e:
                     # Safety net: Ensure tool response is ALWAYS added to prevent orphaned tool calls
                     logger.error(
                         f"Unexpected error executing tool {tool_name}: {e}",
