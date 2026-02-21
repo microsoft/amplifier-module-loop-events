@@ -517,7 +517,7 @@ class EventDrivenOrchestrator:
                                     "content": f"Internal error executing tool: {str(e)}",
                                 }
                             )
-                        except Exception as inner_e:
+                        except (Exception, asyncio.CancelledError) as inner_e:
                             # Critical failure: Even adding error response failed
                             logger.error(
                                 f"Critical: Failed to add error response for tool_call_id {tool_call.id}: {inner_e}"
