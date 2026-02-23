@@ -9,6 +9,7 @@ __amplifier_module_type__ = "orchestrator"
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 from amplifier_core import HookRegistry
@@ -25,6 +26,21 @@ from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolSpec
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_tool_call(tc):
+    """Normalize a tool_call that may be a dict into an object with attribute access.
+
+    Providers may return tool_calls as plain dicts rather than ToolCall objects.
+    This ensures consistent attribute access (.id, .name, .arguments) regardless.
+    """
+    if isinstance(tc, dict):
+        return SimpleNamespace(
+            id=tc.get("id"),
+            name=tc.get("name") or tc.get("tool"),
+            arguments=tc.get("arguments") or {},
+        )
+    return tc
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -238,6 +254,8 @@ class EventDrivenOrchestrator:
 
             # Check for tool calls
             tool_calls = provider.parse_tool_calls(response)
+            if tool_calls:
+                tool_calls = [_normalize_tool_call(tc) for tc in tool_calls]
 
             if not tool_calls:
                 # No tool calls - we're done
