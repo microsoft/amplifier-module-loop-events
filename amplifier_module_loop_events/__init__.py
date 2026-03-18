@@ -16,6 +16,7 @@ from amplifier_core import HookRegistry
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ToolResult
 from amplifier_core.events import ORCHESTRATOR_COMPLETE
+from amplifier_core.events import PROMPT_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
 from amplifier_core.events import PROVIDER_ERROR
 from amplifier_core.events import TOOL_POST
@@ -653,6 +654,15 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
 
         # Emit execution end
         await hooks.emit("execution:end", {"response": final_response})
+
+        # Emit prompt complete for hook consumers (session-naming, redaction, shell hooks)
+        await hooks.emit(
+            PROMPT_COMPLETE,
+            {
+                "response_preview": (final_response or "")[:200],
+                "length": len(final_response or ""),
+            },
+        )
 
         # Emit orchestrator complete event
         await hooks.emit(
