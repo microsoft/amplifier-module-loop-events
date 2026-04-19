@@ -44,6 +44,29 @@ def _normalize_tool_call(tc):
     return tc
 
 
+def _extract_text_from_content(content: list) -> str:
+    """Extract text from response content, filtering out thinking blocks.
+
+    Explicitly checks block.type == "text" rather than relying on
+    hasattr(block, "text"), because content_models.ThinkingContent also has
+    a .text attribute (with type="thinking").  Using hasattr alone would leak
+    thinking text into the final response.
+    """
+    text_parts = []
+    for block in content:
+        block_type = getattr(block, "type", None)
+        type_value = getattr(block_type, "value", block_type) if block_type else None
+        if type_value == "text" and hasattr(block, "text"):
+            text_parts.append(block.text)
+        elif (
+            isinstance(block, dict)
+            and block.get("type", "text") == "text"
+            and "text" in block
+        ):
+            text_parts.append(block["text"])
+    return "\n\n".join(text_parts) if text_parts else ""
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the event-driven orchestrator module.
@@ -263,13 +286,7 @@ class EventDrivenOrchestrator:
                 # Extract text from content blocks
                 content = response.content
                 if isinstance(content, list):
-                    text_parts = []
-                    for block in content:
-                        if hasattr(block, "text"):
-                            text_parts.append(block.text)
-                        elif isinstance(block, dict) and "text" in block:
-                            text_parts.append(block["text"])
-                    final_response = "\n\n".join(text_parts) if text_parts else ""
+                    final_response = _extract_text_from_content(content)
                 else:
                     final_response = content if content else ""
                 # Store structured content from response.content (our Pydantic models)
@@ -616,13 +633,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     # Extract text from content blocks
                     content = response.content
                     if isinstance(content, list):
-                        text_parts = []
-                        for block in content:
-                            if hasattr(block, "text"):
-                                text_parts.append(block.text)
-                            elif isinstance(block, dict) and "text" in block:
-                                text_parts.append(block["text"])
-                        final_response = "\n\n".join(text_parts) if text_parts else ""
+                        final_response = _extract_text_from_content(content)
                     else:
                         final_response = content if content else ""
                     await context.add_message(
