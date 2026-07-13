@@ -156,7 +156,9 @@ class EventDrivenOrchestrator:
 
             # Get messages for LLM request (context handles compaction internally)
             if hasattr(context, "get_messages_for_request"):
-                message_dicts = await context.get_messages_for_request()
+                message_dicts = await context.get_messages_for_request(
+                    provider=provider
+                )
             else:
                 # Fallback for simple contexts without the method
                 message_dicts = await context.get_messages()
@@ -586,7 +588,9 @@ class EventDrivenOrchestrator:
 
             # Get one final response with the reminder
             if hasattr(context, "get_messages_for_request"):
-                message_dicts = await context.get_messages_for_request()
+                message_dicts = await context.get_messages_for_request(
+                    provider=provider
+                )
             else:
                 message_dicts = await context.get_messages()
             message_dicts = list(message_dicts)
