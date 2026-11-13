@@ -7,7 +7,6 @@ Trusts LLM decisions with optional scheduler veto/modification.
 __amplifier_module_type__ = "orchestrator"
 
 import asyncio
-import json
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +24,15 @@ from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolSpec
+
+from ._media import capability
+from ._media import checkpoint_callback
+from ._media import checkpoint_settled
+from ._media import effective_result
+from ._media import request_messages
+from ._media import report_ready
+from ._media import settle_result
+from ._media import stage_result
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +89,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     config = config or {}
     orchestrator = EventDrivenOrchestrator(config)
     await coordinator.mount("orchestrator", orchestrator)
+    await report_ready(coordinator)
     logger.info("Mounted EventDrivenOrchestrator")
     return
 
@@ -143,6 +152,10 @@ class EventDrivenOrchestrator:
         if not provider:
             return "Error: No providers available"
 
+        # The host installs the selected provider adapter. Never hydrate loop-owned
+        # ChatRequests: context/checkpoint state must remain canonical refs-only.
+        media = capability(coordinator)
+        checkpoint = checkpoint_callback(coordinator)
         iteration = 0
         final_response = ""
 
@@ -155,12 +168,7 @@ class EventDrivenOrchestrator:
             iteration += 1
 
             # Get messages for LLM request (context handles compaction internally)
-            if hasattr(context, "get_messages_for_request"):
-                message_dicts = await context.get_messages_for_request()
-            else:
-                # Fallback for simple contexts without the method
-                message_dicts = await context.get_messages()
-            message_dicts = list(message_dicts)  # Convert to list for modification
+            message_dicts = await request_messages(context, provider, media=media)
 
             # Append ephemeral injection from prompt:submit if present (not stored in context)
             if (
@@ -339,6 +347,7 @@ class EventDrivenOrchestrator:
             await context.add_message(assistant_msg)
 
             # Execute tool calls
+            batch_has_media = False
             for tool_call in tool_calls:
                 # Trust LLM's selection
                 tool_name = tool_call.name
@@ -451,7 +460,32 @@ class EventDrivenOrchestrator:
 
                     # Execute tool
                     try:
-                        result = await tool.execute(tool_call.arguments)
+                        # Producer ingress resolves this actual admitted operation,
+                        # not a user-supplied path/name or the pre-scheduler choice.
+                        dispatch_contexts = None
+                        dispatch_task = asyncio.current_task()
+                        previous_dispatch = None
+                        had_dispatch = False
+                        if coordinator is not None:
+                            dispatch_contexts = getattr(
+                                coordinator, "_tool_dispatch_contexts", None
+                            )
+                            if dispatch_contexts is None:
+                                dispatch_contexts = {}
+                                coordinator._tool_dispatch_contexts = dispatch_contexts
+                            had_dispatch = dispatch_task in dispatch_contexts
+                            previous_dispatch = dispatch_contexts.get(dispatch_task)
+                            dispatch_contexts[dispatch_task] = {
+                                "tool_call_id": tool_call.id
+                            }
+                        try:
+                            result = await tool.execute(tool_call.arguments)
+                        finally:
+                            if dispatch_contexts is not None:
+                                if had_dispatch:
+                                    dispatch_contexts[dispatch_task] = previous_dispatch
+                                else:
+                                    dispatch_contexts.pop(dispatch_task, None)
                     except (Exception, asyncio.CancelledError) as e:
                         logger.error(f"Tool execution error: {e}")
                         result = ToolResult(success=False, error={"message": str(e)})
@@ -466,24 +500,31 @@ class EventDrivenOrchestrator:
                             },
                         )
 
-                    # Serialize result for logging
-                    result_data = (
-                        result.model_dump()
-                        if hasattr(result, "model_dump")
-                        else str(result)
-                    )
+                    # Bind after scheduler substitution to the actual dispatched
+                    # operation, and stage before any tool:post observer serializes.
+                    origin = {
+                        "kind": "tool",
+                        "session_id": (
+                            getattr(coordinator, "session_id", None)
+                            or getattr(media, "session_id", None)
+                        ),
+                        "id": tool_call.id,
+                    }
+                    result_data = await stage_result(result, media, origin)
 
                     # Post-tool hook
+                    post_data = {
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call.id,
+                        "tool_input": tool_call.arguments,
+                        "result": result_data,
+                    }
                     post_result = await hooks.emit(
                         TOOL_POST,
-                        {
-                            "tool_name": tool_name,
-                            "tool_input": tool_call.arguments,
-                            "result": result_data,
-                        },
+                        post_data,
                     )
                     if coordinator:
-                        await coordinator.process_hook_result(
+                        post_result = await coordinator.process_hook_result(
                             post_result, "tool:post", tool_name
                         )
 
@@ -504,34 +545,23 @@ class EventDrivenOrchestrator:
                             f"Stored ephemeral injection from tool:post ({tool_name}) for next iteration"
                         )
 
-                    # Check if a hook modified the tool result.
-                    # hooks.emit() chains modify actions: when a hook
-                    # returns action="modify", the data dict is replaced.
-                    # We detect this by checking if the returned "result"
-                    # is a different object than what we originally sent.
-                    modified_result = None
-                    if post_result and post_result.data is not None:
-                        returned_result = post_result.data.get("result")
-                        if (
-                            returned_result is not None
-                            and returned_result is not result_data
-                        ):
-                            modified_result = returned_result
+                    effective = effective_result(post_result, post_data)
+                    tool_content, tool_metadata = await settle_result(
+                        effective,
+                        media=media,
+                        origin=origin,
+                        checkpoint=checkpoint,
+                        modified=post_result.action == "modify",
+                    )
 
-                    if modified_result is not None:
-                        if isinstance(modified_result, (dict, list)):
-                            tool_content = json.dumps(modified_result)
-                        else:
-                            tool_content = str(modified_result)
-                    else:
-                        tool_content = result.get_serialized_output()
-
+                    batch_has_media = batch_has_media or bool(tool_metadata)
                     await context.add_message(
                         {
                             "role": "tool",
                             "name": tool_name,
                             "tool_call_id": tool_call.id,
                             "content": tool_content,
+                            **({"metadata": tool_metadata} if tool_metadata else {}),
                         }
                     )
                     response_added = True
@@ -562,7 +592,14 @@ class EventDrivenOrchestrator:
                     # Continue processing remaining tools - don't let one failure stop all tools
                     continue
 
+            # This is after settled append, not the earlier tool:post autosave.
+            # Failure propagates without another count/send or tool replay.
+            await checkpoint_settled(checkpoint, has_media=batch_has_media)
+
             # Note: Context compaction is handled internally by get_messages_for_request()
+
+        if coordinator and coordinator.cancellation.is_cancelled:
+            return final_response
 
         # Check if we exceeded max iterations (only if not unlimited)
         if (
@@ -585,11 +622,7 @@ class EventDrivenOrchestrator:
             )
 
             # Get one final response with the reminder
-            if hasattr(context, "get_messages_for_request"):
-                message_dicts = await context.get_messages_for_request()
-            else:
-                message_dicts = await context.get_messages()
-            message_dicts = list(message_dicts)
+            message_dicts = await request_messages(context, provider, media=media)
             message_dicts.append(
                 {
                     "role": "user",
