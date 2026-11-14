@@ -7,8 +7,8 @@ Trusts LLM decisions with optional scheduler veto/modification.
 __amplifier_module_type__ = "orchestrator"
 
 import asyncio
-import json
 import logging
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,12 +19,26 @@ from amplifier_core.events import ORCHESTRATOR_COMPLETE
 from amplifier_core.events import PROMPT_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
 from amplifier_core.events import PROVIDER_ERROR
-from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolSpec
+
+from ._media import capability
+from ._media import BOUNDARY_UNAVAILABLE
+from ._media import checkpoint_callback
+from ._media import checkpoint_settled
+from ._media import drop_staged
+from ._media import drop_after_failure
+from ._media import post_boundary
+from ._media import normalize_effective
+from ._media import refs_from_result
+from ._media import request_messages
+from ._media import report_ready
+from ._media import settle_result
+from ._media import stage_result
+from ._media import tool_post
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +157,11 @@ class EventDrivenOrchestrator:
         if not provider:
             return "Error: No providers available"
 
+        # The host installs the selected provider adapter. Never hydrate loop-owned
+        # ChatRequests: context/checkpoint state must remain canonical refs-only.
+        media = capability(coordinator)
+        request_media = media if post_boundary(coordinator) is not None else None
+        checkpoint = checkpoint_callback(coordinator)
         iteration = 0
         final_response = ""
 
@@ -155,12 +174,7 @@ class EventDrivenOrchestrator:
             iteration += 1
 
             # Get messages for LLM request (context handles compaction internally)
-            if hasattr(context, "get_messages_for_request"):
-                message_dicts = await context.get_messages_for_request()
-            else:
-                # Fallback for simple contexts without the method
-                message_dicts = await context.get_messages()
-            message_dicts = list(message_dicts)  # Convert to list for modification
+            message_dicts = await request_messages(context, provider, media=request_media)
 
             # Append ephemeral injection from prompt:submit if present (not stored in context)
             if (
@@ -339,6 +353,7 @@ class EventDrivenOrchestrator:
             await context.add_message(assistant_msg)
 
             # Execute tool calls
+            batch_has_media = False
             for tool_call in tool_calls:
                 # Trust LLM's selection
                 tool_name = tool_call.name
@@ -451,7 +466,32 @@ class EventDrivenOrchestrator:
 
                     # Execute tool
                     try:
-                        result = await tool.execute(tool_call.arguments)
+                        # Producer ingress resolves this actual admitted operation,
+                        # not a user-supplied path/name or the pre-scheduler choice.
+                        dispatch_contexts = None
+                        dispatch_task = asyncio.current_task()
+                        previous_dispatch = None
+                        had_dispatch = False
+                        if coordinator is not None:
+                            dispatch_contexts = getattr(
+                                coordinator, "_tool_dispatch_contexts", None
+                            )
+                            if dispatch_contexts is None:
+                                dispatch_contexts = {}
+                                coordinator._tool_dispatch_contexts = dispatch_contexts
+                            had_dispatch = dispatch_task in dispatch_contexts
+                            previous_dispatch = dispatch_contexts.get(dispatch_task)
+                            dispatch_contexts[dispatch_task] = {
+                                "tool_call_id": tool_call.id
+                            }
+                        try:
+                            result = await tool.execute(tool_call.arguments)
+                        finally:
+                            if dispatch_contexts is not None:
+                                if had_dispatch:
+                                    dispatch_contexts[dispatch_task] = previous_dispatch
+                                else:
+                                    dispatch_contexts.pop(dispatch_task, None)
                     except (Exception, asyncio.CancelledError) as e:
                         logger.error(f"Tool execution error: {e}")
                         result = ToolResult(success=False, error={"message": str(e)})
@@ -466,26 +506,55 @@ class EventDrivenOrchestrator:
                             },
                         )
 
-                    # Serialize result for logging
-                    result_data = (
-                        result.model_dump()
-                        if hasattr(result, "model_dump")
-                        else str(result)
-                    )
+                    # Bind after scheduler substitution to the actual dispatched
+                    # operation, and stage before any tool:post observer serializes.
+                    origin = {
+                        "kind": "tool",
+                        "session_id": (
+                            getattr(coordinator, "session_id", None)
+                            or getattr(media, "session_id", None)
+                        ),
+                        "id": tool_call.id,
+                    }
+                    result_data = await stage_result(result, media, origin)
+                    # Hook callbacks can mutate their input. Keep a refs-only
+                    # staging snapshot so a redaction cannot erase its drop set.
+                    staged_data = deepcopy(result_data)
 
                     # Post-tool hook
-                    post_result = await hooks.emit(
-                        TOOL_POST,
-                        {
-                            "tool_name": tool_name,
-                            "tool_input": tool_call.arguments,
-                            "result": result_data,
-                        },
-                    )
-                    if coordinator:
-                        await coordinator.process_hook_result(
-                            post_result, "tool:post", tool_name
+                    post_data = {
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call.id,
+                        "tool_input": tool_call.arguments,
+                        "result": result_data,
+                    }
+                    try:
+                        post_result, effective, complete = await tool_post(
+                            post_data, hooks=hooks, coordinator=coordinator
                         )
+                    except BaseException:
+                        request_media = None
+                        await drop_after_failure(media, staged_data, origin=origin)
+                        raise
+                    try:
+                        effective = normalize_effective(effective)
+                        if not complete and (
+                            refs_from_result(staged_data) or refs_from_result(effective)
+                        ):
+                            request_media = None
+                        surviving = (
+                            refs_from_result(effective) if complete and checkpoint else []
+                        )
+                        await report_ready(media, complete=complete)
+                    except BaseException:
+                        request_media = None
+                        await drop_after_failure(media, staged_data, origin=origin)
+                        raise
+                    # F1 publishes exactly one disposition for the whole origin.
+                    # Retain commits the surviving subset and drops removed refs
+                    # internally; only a no-survivor outcome needs an explicit drop.
+                    if not surviving:
+                        await drop_staged(media, staged_data, [], origin=origin)
 
                     # Store ephemeral injection from tool:post for next iteration
                     if (
@@ -504,34 +573,29 @@ class EventDrivenOrchestrator:
                             f"Stored ephemeral injection from tool:post ({tool_name}) for next iteration"
                         )
 
-                    # Check if a hook modified the tool result.
-                    # hooks.emit() chains modify actions: when a hook
-                    # returns action="modify", the data dict is replaced.
-                    # We detect this by checking if the returned "result"
-                    # is a different object than what we originally sent.
-                    modified_result = None
-                    if post_result and post_result.data is not None:
-                        returned_result = post_result.data.get("result")
-                        if (
-                            returned_result is not None
-                            and returned_result is not result_data
-                        ):
-                            modified_result = returned_result
+                    tool_content, tool_metadata = await settle_result(
+                        effective,
+                        media=media,
+                        origin=origin,
+                        checkpoint=checkpoint,
+                        modified=post_result.action == "modify",
+                        complete=complete,
+                    )
+                    if (
+                        not complete
+                        and refs_from_result(staged_data)
+                        and BOUNDARY_UNAVAILABLE not in tool_content
+                    ):
+                        tool_content += f"\n\n{BOUNDARY_UNAVAILABLE}"
 
-                    if modified_result is not None:
-                        if isinstance(modified_result, (dict, list)):
-                            tool_content = json.dumps(modified_result)
-                        else:
-                            tool_content = str(modified_result)
-                    else:
-                        tool_content = result.get_serialized_output()
-
+                    batch_has_media = batch_has_media or bool(tool_metadata)
                     await context.add_message(
                         {
                             "role": "tool",
                             "name": tool_name,
                             "tool_call_id": tool_call.id,
                             "content": tool_content,
+                            **({"metadata": tool_metadata} if tool_metadata else {}),
                         }
                     )
                     response_added = True
@@ -559,10 +623,21 @@ class EventDrivenOrchestrator:
                                 f"Critical: Failed to add error response for tool_call_id {tool_call.id}: {inner_e}"
                             )
 
+                    if isinstance(e, asyncio.CancelledError):
+                        # A cancelled host boundary may already have emitted.
+                        # Preserve pairing, but never continue to another send.
+                        raise
                     # Continue processing remaining tools - don't let one failure stop all tools
                     continue
 
+            # This is after settled append, not the earlier tool:post autosave.
+            # Failure propagates without another count/send or tool replay.
+            await checkpoint_settled(checkpoint, has_media=batch_has_media)
+
             # Note: Context compaction is handled internally by get_messages_for_request()
+
+        if coordinator and coordinator.cancellation.is_cancelled:
+            return final_response
 
         # Check if we exceeded max iterations (only if not unlimited)
         if (
@@ -585,11 +660,7 @@ class EventDrivenOrchestrator:
             )
 
             # Get one final response with the reminder
-            if hasattr(context, "get_messages_for_request"):
-                message_dicts = await context.get_messages_for_request()
-            else:
-                message_dicts = await context.get_messages()
-            message_dicts = list(message_dicts)
+            message_dicts = await request_messages(context, provider, media=request_media)
             message_dicts.append(
                 {
                     "role": "user",
