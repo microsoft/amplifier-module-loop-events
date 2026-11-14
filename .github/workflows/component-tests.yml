@@ -23,10 +23,13 @@ jobs:
       AMPLIFIER_MEDIA_BRIDGE_TEST_FILE: ""
       AMPLIFIER_MEDIA_BRIDGE_PROFILE: ""
       PYTHONPATH: ""
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # Qualify the exact PR head rather than a synthetic merge SHA.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
@@ -44,7 +47,14 @@ jobs:
           uv pip install --python .venv/bin/python --group dev \
             "amplifier-core==2.0.2" "pytest==9.0.3" "pytest-asyncio==1.3.0" \
             -e . 2>&1 | tee test-results/install.log
+      - name: Exercise CI verifier negative and positive controls
+        env:
+          COMPONENT_CONTROL_EVIDENCE: test-results/verifier-actual
+        run: |
+          set -o pipefail
+          .venv/bin/python .github/scripts/test_component_tests.py 2>&1 | tee test-results/verifier-controls.log
       - name: Run maintained component tests and record provenance
+        if: always()
         run: .venv/bin/python .github/scripts/component_tests.py
       - name: Retain logs, collection, JUnit and dependency versions
         if: always()
