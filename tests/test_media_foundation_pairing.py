@@ -17,8 +17,10 @@ from types import SimpleNamespace
 import pytest
 from amplifier_core import AmplifierSession, ToolResult
 from amplifier_core.hooks import HookRegistry
+from amplifier_core.message_models import ChatRequest, Message
 from amplifier_core.models import HookResult
 
+from amplifier_module_loop_events import EventDrivenOrchestrator
 from amplifier_module_loop_events._media import MEDIA
 from tests.test_media_conformance import (
     Context,
@@ -45,20 +47,24 @@ def foundation():
     return media, checkpoint
 
 
-def rich_images():
+def rich_images(fmt="PNG"):
     from PIL import Image
 
     encoded = []
     for color in ("red", "blue"):
         output = io.BytesIO()
-        Image.new("RGB", (3, 2), color).save(output, format="PNG")
+        Image.new("RGB", (3, 2), color).save(output, format=fmt)
         encoded.append(base64.b64encode(output.getvalue()).decode())
     return ToolResult(output={"note": "useful text"}, content=[
         {"type": "text", "text": "observation"},
         *[
             {
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": value},
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg" if fmt == "JPEG" else "image/png",
+                    "data": value,
+                },
             }
             for value in encoded
         ],
@@ -66,10 +72,11 @@ def rich_images():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
 @pytest.mark.parametrize("limit", [1, 3])
 @pytest.mark.parametrize("case", ["keep", "partial", "null", "missing", "inplace", "exception"])
 async def test_actual_f1_store_single_origin_disposition_and_checkpoint(
-    foundation, tmp_path, case, limit
+    foundation, tmp_path, case, limit, fmt
 ):
     media, checkpoint = foundation
     ctx, _, provider, coord, capabilities, _ = setup()
@@ -122,7 +129,7 @@ async def test_actual_f1_store_single_origin_disposition_and_checkpoint(
             event["result"]["output"].pop(MEDIA)
         return HookResult()
 
-    result, pixels = rich_images()
+    result, pixels = rich_images(fmt)
     tool = Tool(result)
     try:
         await run(ctx, provider, coord, Hooks(post=post), {"image": tool}, limit=limit)
@@ -132,6 +139,7 @@ async def test_actual_f1_store_single_origin_disposition_and_checkpoint(
         rows = tool_messages(ctx)
         if expected:
             refs = rows[0]["metadata"][MEDIA]["refs"]
+            assert "observation" in rows[0]["content"]
             assert len(refs) == expected
             assert publications[0] == (refs, "retain")
             for item in refs:
@@ -174,7 +182,7 @@ def bridge_installer():
     "inplace-null", "exception", "process-exception", "late-uncovered", "ordinary-text",
     "ordinary-error", "text-hook-adds-refs",
 ])
-async def test_actual_bridge_core_registry_store_and_events_end_to_end(
+async def test_unsealed_bridge_core_registry_store_and_events_fail_closed(
     foundation, bridge_installer, tmp_path, case, limit, profile
 ):
     if os.environ.get("AMPLIFIER_MEDIA_BRIDGE_PROFILE") != profile:
@@ -284,12 +292,15 @@ async def test_actual_bridge_core_registry_store_and_events_end_to_end(
     tool = Tool(result)
     try:
         await run(ctx, provider, coord, HooksObserver(), {"image": tool}, limit=limit)
-        assert len(tool.executions) == len(posts) == len(emitted) == len(processed) == 1
+        assert len(tool.executions) == 1
+        # New graph bridge rejects these unenrolled arbitrary observer wrappers
+        # before emission. It must not replay via legacy hooks after refusal.
+        expected_emissions = 0 if profile == "qualified" and not text_only else 1
+        assert len(posts) == len(emitted) == len(processed) == expected_emissions
         assert len(publications) == (0 if text_only else 1)
-        expected = (
-            (2 if case == "keep" else 1 if case == "partial" else 0)
-            if profile == "qualified" else 0
-        )
+        # Even a positive-capable implementation cannot qualify an unsealed
+        # module/host graph. Positive full initialization has a separate fixture.
+        expected = 0
         message = tool_messages(ctx)[0]
         if expected:
             refs = message["metadata"][MEDIA]["refs"]
@@ -302,21 +313,16 @@ async def test_actual_bridge_core_registry_store_and_events_end_to_end(
             if not text_only:
                 assert publications[0][1] == "drop"
         assert len(provider.requests) == 2 and saved
-        if profile == "safe-negative" or case in {
-            "exception", "process-exception", "late-uncovered",
-            "ordinary-text", "ordinary-error", "text-hook-adds-refs",
-        }:
-            readiness = cap.report("pairing-test", event="readiness", outcome="read")
-            assert not readiness["consumers"]
-            if case != "process-exception" and not text_only:
-                assert "Image unavailable" in message["content"]
-        else:
-            assert "loop-events" in cap.report(
-                "pairing-test", event="readiness", outcome="read"
-            )["consumers"]
+        readiness = cap.report("pairing-test", event="readiness", outcome="read")
+        assert not readiness["consumers"]
+        if profile == "safe-negative" and case != "process-exception" and not text_only:
+            assert "Image unavailable" in message["content"]
         if case == "null-injection":
-            assert message["content"].startswith("null")
-            assert any(m["content"] == "fixture reminder" for m in ctx.messages)
+            if profile == "safe-negative":
+                assert message["content"].startswith("null")
+                assert any(m["content"] == "fixture reminder" for m in ctx.messages)
+            else:
+                assert not any(m["content"] == "fixture reminder" for m in ctx.messages)
         if case == "ordinary-text":
             assert message["content"] == "ordinary text"
         if case == "ordinary-error":
@@ -329,7 +335,7 @@ async def test_actual_bridge_core_registry_store_and_events_end_to_end(
             assert "hook text" in message["content"]
             assert "Image unavailable" in message["content"]
             assert MEDIA not in message["content"]
-        if profile == "safe-negative" and case == "keep":
+        if case == "keep" and profile == "safe-negative":
             # f943 deliberately supplies no authoritative effective ordinary
             # result. Preserve explicit null, never reconstruct old useful text.
             assert message["content"].startswith("null")
@@ -346,10 +352,11 @@ async def test_actual_bridge_core_registry_store_and_events_end_to_end(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
 @pytest.mark.parametrize("limit", [1, 3])
 @pytest.mark.parametrize("vision", [False, True])
 async def test_actual_f1_private_provider_complete_preserves_canonical_state(
-    foundation, tmp_path, limit, vision
+    foundation, tmp_path, limit, vision, fmt
 ):
     from amplifier_foundation.session.media_provider import MediaPreparedProvider
 
@@ -370,6 +377,10 @@ async def test_actual_f1_private_provider_complete_preserves_canonical_state(
 
         def get_media_request_support(self, **kwargs):
             return {"v": 1, "positions": ["tool"] if vision else []}
+
+        async def request_budget(self, request, *, request_options):
+            cap.validate(request, purpose="provider-count", request_options=request_options)
+            return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
 
         async def complete(self, request, **kwargs):
             cap.validate(request, purpose="provider-send", request_options=kwargs)
@@ -406,7 +417,7 @@ async def test_actual_f1_private_provider_complete_preserves_canonical_state(
         return True
 
     capabilities["session.durable_checkpoint"] = save
-    result, pixels = rich_images()
+    result, pixels = rich_images(fmt)
     try:
         await run(ctx, adapter, coord, tools={"image": Tool(result)}, limit=limit)
         assert len(projected) == 2
@@ -537,3 +548,186 @@ async def test_enabled_f1_ingest_refusal_is_not_optional_disabled_fallback(found
     assert len(calls) == 1
     assert calls[0]["policy"] is None
     assert not cap._consumers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 3])
+@pytest.mark.parametrize("preliminary_error", [False, True])
+async def test_actual_f1_final_budget_and_complete_share_full_canonical_candidate(
+    foundation, tmp_path, limit, preliminary_error, caplog
+):
+    """A context-selected count is not a final request/tools/options count."""
+    from amplifier_foundation.session.media_provider import MediaPreparedProvider
+
+    media, checkpoint = foundation
+    ctx, _, raw, coord, capabilities, _ = setup()
+    capabilities.pop(MEDIA)
+    coord.register_capability = capabilities.__setitem__
+    store = media.SessionMediaStore(
+        tmp_path / "media", coord.session_id,
+        policy=media.MediaPolicy(1024 * 1024, 10000, 10),
+        checkpoint_verifier=checkpoint.verified_checkpoint_refs,
+    )
+    cap = media.bind_session_media(coord, store=store, enabled=True)
+    counts, sends, order = [], [], []
+
+    class Wire:
+        default_model = "fixture"
+
+        def get_media_request_support(self, **kwargs):
+            return {"v": 1, "positions": ["tool"]}
+
+        async def request_budget(self, request, *, request_options, context_estimate=0):
+            cap.validate(request, purpose="provider-count", request_options=request_options)
+            if preliminary_error and not request.tools:
+                raise ValueError("private preliminary payload " + rich_images()[1][0])
+            counts.append((request, request.model_dump(), deepcopy(request_options)))
+            order.append("count")
+            return {
+                "estimated_input_tokens": 10, "input_limit_tokens": 100,
+                "context_token_budget": 100,
+                "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10},
+            }
+
+        async def complete(self, request, **kwargs):
+            cap.validate(request, purpose="provider-send", request_options=kwargs)
+            sends.append((request, request.model_dump(), deepcopy(kwargs)))
+            order.append("send")
+            return SimpleNamespace(
+                content="" if len(sends) == 1 else "done", metadata=None,
+                calls=raw.calls if len(sends) == 1 else [],
+            )
+
+        def parse_tool_calls(self, response):
+            return response.calls
+
+    adapter = MediaPreparedProvider(
+        Wire(), cap,
+        provider_identity={"provider": "fixture", "account": "test", "generation": 1},
+    )
+
+    async def messages(provider=None):
+        assert provider is adapter
+        if any(MEDIA in (row.get("metadata") or {}) for row in ctx.messages):
+            # Actual context APIs can count a selection before the loop adds
+            # tools, reasoning and finalization reminder. It is not dispatch fit.
+            preliminary = ChatRequest(messages=[Message(**row) for row in ctx.messages])
+            await provider.request_budget(preliminary, request_options={})
+        return ctx.messages
+
+    ctx.get_messages_for_request = messages
+
+    def save():
+        (tmp_path / "transcript.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in ctx.messages)
+        )
+        receipt = checkpoint.acknowledge_legacy_checkpoint(
+            tmp_path, session_id=coord.session_id, expected_messages=ctx.messages
+        )
+        store.acknowledge_checkpoint(receipt)
+        order.append("checkpoint")
+        return True
+
+    capabilities["session.durable_checkpoint"] = save
+    result, pixels = rich_images()
+    try:
+        if preliminary_error:
+            with pytest.raises(ValueError, match="private diagnostics were not retained") as caught:
+                await EventDrivenOrchestrator({"max_iterations": limit}).execute(
+                    "inspect", ctx, {"selected": adapter}, {"image": Tool(result)}, Hooks(), coord
+                )
+            assert len(sends) == 1
+            for value in pixels:
+                assert value not in str(caught.value) + caplog.text
+            from amplifier_module_loop_events._media import request_messages
+            # The historical committed ref can still reach context counting when
+            # outgoing media is ineligible. Privacy must not follow eligibility.
+            with pytest.raises(ValueError, match="private diagnostics were not retained") as blocked:
+                await request_messages(ctx, adapter, media=None, private_media=cap)
+            for value in pixels:
+                assert value not in str(blocked.value) + caplog.text
+            assert len(sends) == 1
+            return
+        answer = await EventDrivenOrchestrator({
+            "max_iterations": limit, "reasoning_effort": "low", "extended_thinking": True,
+        }).execute(
+            "inspect", ctx, {"selected": adapter}, {"image": Tool(result)},
+            Hooks(post=lambda event: HookResult(
+                action="inject_context", context_injection="ephemeral observation",
+                ephemeral=True, append_to_last_tool_result=True,
+            )),
+            coord,
+        )
+        assert answer == "done"
+        assert len(sends) == 2
+        # The final count must use the exact private projection sent, including
+        # tool schema, reasoning, reminder and effective kwargs.
+        assert counts[-1][0] is sends[-1][0]
+        assert counts[-1][1] == sends[-1][1]
+        assert counts[-1][2] == sends[-1][2] == {"extended_thinking": True}
+        assert counts[-1][1]["tools"]
+        assert counts[-1][1]["reasoning_effort"] == "low"
+        assert "ephemeral observation" in json.dumps(counts[-1][1]["messages"])
+        if limit == 1:
+            assert "orchestrator-loop-limit" in json.dumps(counts[-1][1]["messages"])
+        assert "ephemeral observation" not in json.dumps(ctx.messages)
+        assert order.index("checkpoint") < order.index("count", order.index("checkpoint"))
+        assert order[-2:] == ["count", "send"]
+        for value in pixels:
+            assert value not in json.dumps(ctx.messages)
+    finally:
+        await adapter.aclose()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_actual_f1_owned_warning_only_without_count(foundation, tmp_path):
+    from amplifier_foundation.session.media_provider import MediaPreparedProvider
+
+    from amplifier_module_loop_events._media import check_final_budget
+
+    media, checkpoint = foundation
+    sent = []
+    store = media.SessionMediaStore(
+        tmp_path / "media", "session-test",
+        policy=media.MediaPolicy(1024 * 1024, 10000, 10),
+        checkpoint_verifier=checkpoint.verified_checkpoint_refs,
+    )
+    cap = media.SessionMediaCapability(store, enabled=True)
+    origin = {"kind": "tool", "session_id": "session-test", "id": "fixture"}
+    rich, _ = rich_images()
+    staged = await cap.ingest(
+        rich, source_format="core-tool-result", origin=origin, policy=None
+    )
+    refs = staged["staged_refs"]
+    await cap.publish(refs, origin=origin, disposition="retain")
+    row = {"role": "user", "content": "image observation", "metadata": {MEDIA: {"refs": refs}}}
+    (tmp_path / "transcript.jsonl").write_text(json.dumps(row) + "\n")
+    receipt = checkpoint.acknowledge_legacy_checkpoint(
+        tmp_path, session_id="session-test", expected_messages=[row]
+    )
+    store.acknowledge_checkpoint(receipt)
+
+    class TextOnly:
+        default_model = "text-fixture"
+
+        async def complete(self, request, **kwargs):
+            cap.validate(request, purpose="provider-send", request_options=kwargs)
+            sent.append(request.model_dump())
+            return "done"
+
+    adapter = MediaPreparedProvider(
+        TextOnly(), cap,
+        provider_identity={"provider": "fixture", "account": "test", "generation": 1},
+    )
+    request = ChatRequest(messages=[Message(**row)])
+    before = request.model_dump()
+    try:
+        await check_final_budget(adapter, request, {})
+        assert await adapter.complete(request) == "done"
+        assert "Image unavailable" in json.dumps(sent)
+        assert request.model_dump() == before
+        assert not hasattr(adapter, "request_budget")
+    finally:
+        await adapter.aclose()
+        store.close()

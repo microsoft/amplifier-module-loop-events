@@ -140,9 +140,11 @@ class Provider:
         self.requests = []
         self.counts = []
 
-    async def request_budget(self, messages):
-        # Deliberately no token or exact-image-cost claim.
-        self.counts.append(deepcopy(messages))
+    async def request_budget(self, messages, *, request_options=None):
+        # Synthetic owner estimate, never an actual provider/image-count claim.
+        value = messages.model_dump() if hasattr(messages, "model_dump") else messages
+        self.counts.append(deepcopy(value))
+        return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
 
     async def complete(self, request, **kwargs):
         self.requests.append(request.model_dump())
@@ -502,6 +504,7 @@ async def test_host_adapter_owns_private_count_dispatch_projection(limit, vision
         def __init__(self):
             super().__init__()
             self.count_projections = []
+            self.final_count_projections = []
             self.send_projections = []
 
         def project(self, messages):
@@ -529,9 +532,15 @@ async def test_host_adapter_owns_private_count_dispatch_projection(limit, vision
                     message["content"] += "\n\n" + UNAVAILABLE
             return private
 
-        async def request_budget(self, messages):
+        async def request_budget(self, messages, *, request_options=None):
             # The actual installed host must prepare before any real count.
-            self.count_projections.append(self.project(messages))
+            if hasattr(messages, "model_dump"):
+                self.final_count_projections.append(
+                    self.project(messages.model_dump()["messages"])
+                )
+            else:
+                self.count_projections.append(self.project(messages))
+            return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
 
         async def complete(self, request, **kwargs):
             self.send_projections.append(self.project(request.model_dump()["messages"]))
@@ -555,6 +564,7 @@ async def test_host_adapter_owns_private_count_dispatch_projection(limit, vision
     assert all(p is provider for p in ctx.providers)
     assert PIXELS not in json.dumps([ctx.messages, checkpoints, provider.requests])
     if vision:
+        assert provider.final_count_projections[-1] == provider.send_projections[-1]
         assert PIXELS in json.dumps(provider.send_projections[1])
         projected_tool = next(
             m for m in provider.send_projections[1] if m["role"] == "tool"
@@ -646,7 +656,7 @@ async def test_ready_only_after_complete_processed_boundary_not_mount(async_repo
 
 @pytest.mark.asyncio
 async def test_legacy_context_signature_is_not_called_twice_on_internal_typeerror():
-    ctx, _, provider, coord, _, _ = setup()
+    ctx, _, provider, coord, capabilities, _ = setup()
     calls = []
 
     async def get_messages():
@@ -662,6 +672,11 @@ async def test_legacy_context_signature_is_not_called_twice_on_internal_typeerro
         raise TypeError("synthetic compaction internal error")
 
     ctx.get_messages_for_request = failing_messages
+    calls.clear()
+    with pytest.raises(ValueError, match="private diagnostics were not retained"):
+        await run(ctx, provider, coord)
+    assert calls == [True]
+    capabilities.pop(MEDIA)
     calls.clear()
     with pytest.raises(TypeError, match="synthetic compaction"):
         await run(ctx, provider, coord)
@@ -1045,3 +1060,126 @@ async def test_text_sibling_does_not_disable_prior_qualified_canonical_media():
     )
     assert first["metadata"][MEDIA]["refs"] == cap.staged["call-1"]
     assert tool_messages(ctx)[1]["content"] == "ordinary text"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 3])
+@pytest.mark.parametrize("seam", ["count", "send"])
+async def test_media_provider_exception_payload_never_enters_public_diagnostics(
+    caplog, limit, seam
+):
+    ctx, _, provider, coord, _, _ = setup()
+    hooks = Hooks()
+    original_complete = provider.complete
+
+    async def budget(request, *, request_options=None):
+        if hasattr(request, "messages") and seam == "count":
+            raise ValueError("private input " + PIXELS)
+        return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
+
+    async def complete(request, **kwargs):
+        if len(provider.requests) == 1 and seam == "send":
+            raise ValueError("private input " + PIXELS)
+        return await original_complete(request, **kwargs)
+
+    provider.request_budget = budget
+    provider.complete = complete
+    answer = await run(ctx, provider, coord, hooks, limit=limit)
+    assert PIXELS not in caplog.text
+    assert PIXELS not in json.dumps([answer, ctx.messages, hooks.events])
+    assert any(event == "provider:error" for event, _ in hooks.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    None, {}, {"estimated_input_tokens": True, "input_limit_tokens": 100},
+    {"estimated_input_tokens": float("nan"), "input_limit_tokens": 100},
+    {"estimated_input_tokens": -1, "input_limit_tokens": 100},
+    {"estimated_input_tokens": 1, "input_limit_tokens": 0},
+    {"estimated_input_tokens": 101, "input_limit_tokens": 100},
+    {"estimated_input_tokens": 1, "input_limit_tokens": 100, "fits": False},
+])
+async def test_final_media_budget_invalid_or_over_limit_never_dispatches(result):
+    ctx, _, provider, coord, _, _ = setup()
+
+    async def budget(request, *, request_options=None):
+        return result
+
+    provider.request_budget = budget
+    await run(ctx, provider, coord)
+    assert len(provider.requests) == 1
+    assert tool_messages(ctx)[0]["metadata"][MEDIA]["refs"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 3])
+@pytest.mark.parametrize("kind", ["cooperative", "task"])
+async def test_cancellation_during_final_media_count_prevents_send(limit, kind):
+    ctx, _, provider, coord, _, _ = setup()
+
+    async def budget(request, *, request_options=None):
+        if hasattr(request, "messages"):
+            if kind == "task":
+                raise asyncio.CancelledError()
+            coord.cancellation.is_cancelled = True
+        return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
+
+    provider.request_budget = budget
+    with pytest.raises(asyncio.CancelledError):
+        await run(ctx, provider, coord, limit=limit)
+    assert len(provider.requests) == 1
+    assert tool_messages(ctx)[0]["metadata"][MEDIA]["refs"]
+
+
+@pytest.mark.asyncio
+async def test_final_construction_failure_not_masked_by_unbound_request():
+    ctx, _, provider, coord, _, _ = setup()
+    tool = Tool()
+    original_execute = tool.execute
+
+    async def execute(arguments):
+        result = await original_execute(arguments)
+        tool.input_schema = 1
+        return result
+
+    tool.execute = execute
+    hooks = Hooks()
+    await run(ctx, provider, coord, hooks, {"image": tool}, limit=1)
+    assert len(provider.requests) == 1
+    errors = [data for event, data in hooks.events if event == "provider:error"]
+    assert errors and "private transport diagnostics" in errors[0]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_context_target_not_a_second_provider_budget_ceiling():
+    from amplifier_core.message_models import ChatRequest, Message
+
+    from amplifier_module_loop_events._media import check_final_budget
+
+    request = ChatRequest(messages=[Message(
+        role="tool", content="image", tool_call_id="actual",
+        metadata={MEDIA: {"refs": [ref("actual")]}},
+    )])
+    observed = []
+
+    async def budget(candidate, *, request_options):
+        observed.append((candidate, request_options))
+        return {
+            "estimated_input_tokens": 100000, "input_limit_tokens": 267904,
+            "context_token_budget": 80000,
+        }
+
+    await check_final_budget(SimpleNamespace(request_budget=budget), request, {})
+    assert observed == [(request, {})]
+
+
+@pytest.mark.asyncio
+async def test_ref_request_without_budget_or_owned_fallback_refuses_before_send():
+    ctx, _, provider, coord, _, _ = setup()
+    provider.request_budget = None
+    # Context itself must feature-detect callable optional methods.
+    async def messages(provider=None):
+        return ctx.messages
+    ctx.get_messages_for_request = messages
+    await run(ctx, provider, coord)
+    assert len(provider.requests) == 1

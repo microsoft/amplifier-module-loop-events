@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import math
 from collections.abc import Mapping
 from copy import deepcopy
 
@@ -223,7 +224,10 @@ def serialize_result(value, *, modified):
             result = ToolResult(**value)
             if result.output is None and result.content:
                 return "\n\n".join(block.text for block in result.content)
-            return result.get_serialized_output()
+            output = result.get_serialized_output()
+            if result.content:
+                output += "\n\n" + "\n\n".join(block.text for block in result.content)
+            return output
     if isinstance(value, (dict, list)) or value is None:
         return json.dumps(value)
     return str(value)
@@ -290,18 +294,26 @@ async def checkpoint_settled(checkpoint, *, has_media):
         raise MediaCheckpointError("Settled tool checkpoint was not acknowledged")
 
 
-async def request_messages(context, provider, *, media):
+async def request_messages(context, provider, *, media, private_media=None):
     getter = getattr(context, "get_messages_for_request", None)
     if getter is not None:
         # Inspect before calling: catching TypeError could repeat a compaction effect.
         parameters = inspect.signature(getter).parameters.values()
         supports_provider = any(
-            p.name == "provider" or p.kind == inspect.Parameter.VAR_KEYWORD
+            (p.name == "provider" and p.kind != inspect.Parameter.POSITIONAL_ONLY)
+            or p.kind == inspect.Parameter.VAR_KEYWORD
             for p in parameters
         )
-        messages = (
-            await getter(provider=provider) if supports_provider else await getter()
-        )
+        try:
+            messages = (
+                await getter(provider=provider) if supports_provider else await getter()
+            )
+        except Exception:
+            if media is not None or private_media is not None:
+                raise ValueError(
+                    "Media context preparation failed; private diagnostics were not retained"
+                ) from None
+            raise
     else:
         messages = await context.get_messages()
     messages = deepcopy(list(messages))
@@ -316,3 +328,82 @@ async def request_messages(context, provider, *, media):
                 else:
                     message["content"] = f"{content}\n\n{UNAVAILABLE}"
     return messages
+
+
+async def check_final_budget(provider, request, request_options):
+    """Count the exact assembled canonical media candidate, never hydrate here.
+
+    Context selection/compaction can count earlier candidates. Its fit is not a
+    witness for the later tools/reminder/options assembled by this loop.
+    """
+    if not any(MEDIA in (message.metadata or {}) for message in request.messages):
+        return
+    budget = getattr(provider, "request_budget", None)
+    if not callable(budget):
+        if not await check_warning_only_fallback(provider, request, request_options):
+            raise ValueError("Media request requires a budget or owned warning-only fallback")
+        return
+    parameters = inspect.signature(budget).parameters
+    options_parameter = parameters.get("request_options")
+    if options_parameter is None or options_parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+        raise ValueError("Media budget requires named request_options support")
+    result = budget(request, request_options=deepcopy(request_options))
+    if inspect.isawaitable(result):
+        result = await result
+    if result is None:
+        if await check_warning_only_fallback(provider, request, request_options):
+            return
+        raise ValueError("Media budget is unavailable for this request")
+    if not isinstance(result, Mapping):
+        raise TypeError("Media budget is unavailable for this request")
+    if result.get("fits") is False:
+        raise ValueError("Media request exceeds the provider budget")
+    # Accept the owner's numeric estimate without calling it an exact count.
+    # A malformed or missing cost/limit cannot certify a media fit.
+    cost = result.get("estimated_input_tokens")
+    limit = result.get("input_limit_tokens")
+    if (
+        type(cost) not in (int, float) or type(limit) not in (int, float)
+        or not math.isfinite(cost) or not math.isfinite(limit)
+        or cost < 0 or limit <= 0
+    ):
+        raise ValueError("Media budget lacks a valid numeric cost and limit")
+    if cost > limit:
+        raise ValueError("Media request exceeds the provider budget")
+    target = result.get("context_token_budget")
+    if target is not None and (type(target) is not int or target < 0):
+        raise ValueError("Media budget has an invalid context rebuild target")
+
+
+async def check_warning_only_fallback(provider, request, request_options):
+    """Use only the owner's exact warning-only witness, never a fake count.
+
+    Missing optional adapter support makes no fit claim and returns False for
+    local refusal. A present witness must refuse visual/mandatory/opaque
+    candidates itself. Its errors never trigger fallback or another count call.
+    """
+    witness = getattr(provider, "media_text_fallback_witness", None)
+    if not callable(witness):
+        return False
+    value = witness(request, request_options=deepcopy(request_options))
+    if inspect.isawaitable(value):
+        value = await value
+    if (
+        not isinstance(value, Mapping)
+        or type(value.get("v")) is not int or value["v"] != 1
+        or value.get("validated") is not True
+        or not isinstance(value.get("projection_digest"), str)
+        or len(value["projection_digest"]) != 64
+        or any(char not in "0123456789abcdef" for char in value["projection_digest"])
+        or not isinstance(value.get("messages"), list)
+    ):
+        raise ValueError("Media text fallback witness is invalid")
+    return True
+
+
+def provider_error_message(error, request):
+    # Hydrated provider copies stay private even when a decoder/SDK includes its
+    # request in an exception. Preserve legacy text diagnostics outside media.
+    if request is None or any(MEDIA in (message.metadata or {}) for message in request.messages):
+        return "Media provider request failed; private transport diagnostics were not retained"
+    return str(error)

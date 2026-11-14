@@ -29,10 +29,12 @@ from ._media import capability
 from ._media import BOUNDARY_UNAVAILABLE
 from ._media import checkpoint_callback
 from ._media import checkpoint_settled
+from ._media import check_final_budget
 from ._media import drop_staged
 from ._media import drop_after_failure
 from ._media import post_boundary
 from ._media import normalize_effective
+from ._media import provider_error_message
 from ._media import refs_from_result
 from ._media import request_messages
 from ._media import report_ready
@@ -174,57 +176,11 @@ class EventDrivenOrchestrator:
             iteration += 1
 
             # Get messages for LLM request (context handles compaction internally)
-            message_dicts = await request_messages(context, provider, media=request_media)
+            message_dicts = await request_messages(
+                context, provider, media=request_media, private_media=media
+            )
 
-            # Append ephemeral injection from prompt:submit if present (not stored in context)
-            if (
-                prompt_submit_result.action == "inject_context"
-                and prompt_submit_result.ephemeral
-                and prompt_submit_result.context_injection
-            ):
-                message_dicts.append(
-                    {
-                        "role": prompt_submit_result.context_injection_role,
-                        "content": prompt_submit_result.context_injection,
-                    }
-                )
-
-            # Apply pending ephemeral injections from tool:post hooks
-            if self._pending_ephemeral_injections:
-                for injection in self._pending_ephemeral_injections:
-                    if (
-                        injection.get("append_to_last_tool_result")
-                        and len(message_dicts) > 0
-                    ):
-                        last_msg = message_dicts[-1]
-                        if last_msg.get("role") == "tool":
-                            original_content = last_msg.get("content", "")
-                            message_dicts[-1] = {
-                                **last_msg,
-                                "content": f"{original_content}\n\n{injection['content']}",
-                            }
-                            logger.debug(
-                                "Applied pending ephemeral injection to last tool result"
-                            )
-                        else:
-                            message_dicts.append(
-                                {
-                                    "role": injection["role"],
-                                    "content": injection["content"],
-                                }
-                            )
-                            logger.debug(
-                                "Last message not a tool result, created new message for injection"
-                            )
-                    else:
-                        message_dicts.append(
-                            {"role": injection["role"], "content": injection["content"]}
-                        )
-                        logger.debug(
-                            "Applied pending ephemeral injection as new message"
-                        )
-                # Clear pending injections after applying
-                self._pending_ephemeral_injections = []
+            self._apply_request_injections(message_dicts, prompt_submit_result)
 
             # Convert dicts to ChatRequest for provider
             messages_objects = [Message(**msg) for msg in message_dicts]
@@ -252,6 +208,9 @@ class EventDrivenOrchestrator:
                 kwargs = {}
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
+                await check_final_budget(provider, chat_request, kwargs)
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    raise asyncio.CancelledError()
                 response = await provider.complete(chat_request, **kwargs)
 
                 # Check for immediate cancellation after provider returns
@@ -264,30 +223,32 @@ class EventDrivenOrchestrator:
                 # Task was cancelled - propagate the cancellation
                 raise
             except LLMError as e:
-                logger.error(f"Provider error: {e}")
+                safe_error = provider_error_message(e, chat_request)
+                logger.error(f"Provider error: {safe_error}")
                 await hooks.emit(
                     PROVIDER_ERROR,
                     {
                         "error_type": "completion_failed",
-                        "error_message": str(e),
+                        "error_message": safe_error,
                         "severity": "high",
                         "retryable": e.retryable,
                         "status_code": e.status_code,
                     },
                 )
-                final_response = f"Error getting response: {e}"
+                final_response = f"Error getting response: {safe_error}"
                 break
             except Exception as e:
-                logger.error(f"Provider error: {e}")
+                safe_error = provider_error_message(e, chat_request)
+                logger.error(f"Provider error: {safe_error}")
                 await hooks.emit(
                     PROVIDER_ERROR,
                     {
                         "error_type": "completion_failed",
-                        "error_message": str(e),
+                        "error_message": safe_error,
                         "severity": "high",
                     },
                 )
-                final_response = f"Error getting response: {e}"
+                final_response = f"Error getting response: {safe_error}"
                 break
 
             # Check for tool calls
@@ -660,7 +621,10 @@ class EventDrivenOrchestrator:
             )
 
             # Get one final response with the reminder
-            message_dicts = await request_messages(context, provider, media=request_media)
+            message_dicts = await request_messages(
+                context, provider, media=request_media, private_media=media
+            )
+            self._apply_request_injections(message_dicts, prompt_submit_result)
             message_dicts.append(
                 {
                     "role": "user",
@@ -672,6 +636,7 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 }
             )
 
+            max_iter_chat_request = None
             try:
                 # Convert dicts to ChatRequest
                 messages_objects = [Message(**msg) for msg in message_dicts]
@@ -697,6 +662,9 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 kwargs = {}
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
+                await check_final_budget(provider, max_iter_chat_request, kwargs)
+                if coordinator and coordinator.cancellation.is_cancelled:
+                    raise asyncio.CancelledError()
                 response = await provider.complete(max_iter_chat_request, **kwargs)
                 tool_calls = provider.parse_tool_calls(response)
 
@@ -712,24 +680,26 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                     )
 
             except LLMError as e:
-                logger.error(f"Error getting final response after max iterations: {e}")
+                safe_error = provider_error_message(e, max_iter_chat_request)
+                logger.error(f"Error getting final response after max iterations: {safe_error}")
                 await hooks.emit(
                     PROVIDER_ERROR,
                     {
                         "error_type": "completion_failed",
-                        "error_message": str(e),
+                        "error_message": safe_error,
                         "severity": "high",
                         "retryable": e.retryable,
                         "status_code": e.status_code,
                     },
                 )
             except Exception as e:
-                logger.error(f"Error getting final response after max iterations: {e}")
+                safe_error = provider_error_message(e, max_iter_chat_request)
+                logger.error(f"Error getting final response after max iterations: {safe_error}")
                 await hooks.emit(
                     PROVIDER_ERROR,
                     {
                         "error_type": "completion_failed",
-                        "error_message": str(e),
+                        "error_message": safe_error,
                         "severity": "high",
                     },
                 )
@@ -757,6 +727,33 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
         )
 
         return final_response
+
+    def _apply_request_injections(self, messages, prompt_result):
+        """Apply ephemeral overlays before the final request is counted/sent."""
+        if (
+            prompt_result.action == "inject_context"
+            and prompt_result.ephemeral
+            and prompt_result.context_injection
+        ):
+            messages.append({
+                "role": prompt_result.context_injection_role,
+                "content": prompt_result.context_injection,
+            })
+        for injection in self._pending_ephemeral_injections:
+            if (
+                injection.get("append_to_last_tool_result")
+                and messages and messages[-1].get("role") == "tool"
+            ):
+                last = messages[-1]
+                messages[-1] = {
+                    **last,
+                    "content": f"{last.get('content', '')}\n\n{injection['content']}",
+                }
+            else:
+                messages.append({
+                    "role": injection["role"], "content": injection["content"],
+                })
+        self._pending_ephemeral_injections = []
 
     def _select_provider(self, providers: dict[str, Any]) -> Any:
         """
