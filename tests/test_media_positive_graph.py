@@ -66,6 +66,7 @@ class GraphLoader:
     "unsupported-none-budget", "visual-none-budget", "continue-null-echo",
     "special-null-echo", "count-mutation", "checkpoint-order",
     "budget-over-limit", "cancel-before-count", "cancel-after-count",
+    "preliminary-cancel",
 ])
 async def test_public_graph_actual_core_store_checkpoint_count_send(
     foundation, bridge_installer, tmp_path, fmt, limit, case
@@ -81,6 +82,7 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
     }, session_id="events-positive")
     core = session.coordinator
     order, posts, counted, sent, canonical, checkpoints = [], [], [], [], [], []
+    context_releases = []
     rich, pixels = rich_images(fmt)
     digest = [hashlib.sha256(base64.b64decode(value)).hexdigest() for value in pixels]
 
@@ -108,9 +110,19 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
                 "cancel-before-count", "cancel-after-count",
             } and has_media:
                 preliminary = ChatRequest(messages=[Message(**row) for row in self.messages])
-                await provider.request_budget(
-                    preliminary, request_options={}, context_estimate=7
-                )
+                try:
+                    await provider.request_budget(
+                        preliminary, request_options={}, context_estimate=7
+                    )
+                    if case == "preliminary-cancel":
+                        core.cancellation.request_graceful()
+                finally:
+                    # Participating fixture context owns its preliminary object.
+                    # This is not a claim that the loop can release a context's
+                    # different cached candidate by guessing/copying its identity.
+                    context_releases.append(provider.release_media_request(
+                        preliminary, request_options={},
+                    ))
             return self.messages
 
     context = Context()
@@ -290,6 +302,8 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
     if case == "unknown-observed":
         core.hooks.register("tool:post", lambda e, d: HookResult(), name="unqualified")
 
+    checkpoint_attempts, checkpoint_refusals = [], []
+
     def save():
         if case == "checkpoint-failure":
             raise OSError("fixture save refused")
@@ -304,9 +318,14 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
         (tmp_path / "transcript.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in messages)
         )
-        ack = checkpoint.acknowledge_legacy_checkpoint(
-            tmp_path, session_id=core.session_id, expected_messages=context.messages,
-        )
+        checkpoint_attempts.append(messages)
+        try:
+            ack = checkpoint.acknowledge_legacy_checkpoint(
+                tmp_path, session_id=core.session_id, expected_messages=context.messages,
+            )
+        except checkpoint.CheckpointRefused as error:
+            checkpoint_refusals.append(str(error))
+            raise
         store.acknowledge_checkpoint(ack)
         checkpoints.append(messages)
         order.append("checkpoint")
@@ -314,8 +333,8 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
 
     core.register_capability("session.durable_checkpoint", save)
     try:
-        if case in {"cancel-before-count", "cancel-after-count", "budget-over-limit"}:
-            if case.startswith("cancel-"):
+        if case in {"cancel-before-count", "cancel-after-count", "budget-over-limit", "preliminary-cancel"}:
+            if "cancel" in case:
                 # The real Core 2 Rust session boundary translates the loop's
                 # propagated CancelledError to RuntimeError; direct-loop tests
                 # separately require the original task cancellation unchanged.
@@ -325,20 +344,38 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
                 assert await session.execute("Inspect the synthetic observation") != "done"
             assert len(sent) == len(executions) == len(posts) == len(publications) == 1
             assert len(counted) == (0 if case == "cancel-before-count" else 1)
-            assert len(checkpoints) == len(releases) == 1
-            assert releases[0][1] == {"extended_thinking": True}
+            assert len(checkpoints) == 1
+            assert len(releases) == (2 if case == "preliminary-cancel" else 1)
+            assert releases[-1][1] == {"extended_thinking": True}
             # A pre-count cancel has no cached final candidate to release;
             # after count, the exact owned candidate really was abandoned.
-            assert releases[0][2] is (case != "cancel-before-count")
+            assert releases[-1][2] is (case not in {"cancel-before-count", "preliminary-cancel"})
+            if case == "preliminary-cancel":
+                assert context_releases == [True]
+                assert releases[0][1:] == ({}, True)
             assert adapter._candidate is None and not adapter._active
+            assert not adapter._lifetimes and not adapter._owned_overlays
+            assert all(private.messages == [] for private, _, _ in counted)
             assert bridge.validate_receipt(receipt)
             assert not any(value in json.dumps(context.messages) for value in pixels)
+            with graph.transition():
+                pass
+            assert not bridge.validate_receipt(receipt)
+            assert bridge.validate_receipt(bridge.graph_receipt)
             return
         if case in {"checkpoint-failure", "checkpoint-order"}:
             with pytest.raises(Exception, match="checkpoint"):
                 await session.execute("Inspect the synthetic observation")
             assert len(sent) == 1
             assert len(counted) == 0
+            assert not checkpoints
+            if case == "checkpoint-order":
+                assert len(executions) == len(posts) == len(publications) == 2
+                assert [post["tool_call_id"] for post in posts] == ["actual-call", "actual-call-2"]
+                assert all(disposition == "retain" for _, _, disposition in publications)
+                assert [[ref["sha256"] for ref in refs] for refs, _, _ in publications] == [digest, digest]
+                assert len(checkpoint_attempts) == 1
+                assert checkpoint_refusals == ["Canonical checkpoint rows differ"]
             return
         answer = await session.execute("Inspect the synthetic observation")
         if case == "unknown-observed":

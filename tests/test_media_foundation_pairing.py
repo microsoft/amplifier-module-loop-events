@@ -740,8 +740,9 @@ async def test_actual_f1_owned_warning_only_without_count(foundation, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["over-limit", "malformed", "cancel-before", "cancel-after", "witness-refusal"])
+@pytest.mark.parametrize("cleanup", ["normal", "false", "raise"])
 async def test_actual_f1_local_abandon_releases_exact_candidate_not_shared_provider(
-    foundation, tmp_path, decision
+    foundation, tmp_path, decision, cleanup, caplog
 ):
     from amplifier_foundation.session.media_provider import MediaPreparedProvider
 
@@ -801,6 +802,11 @@ async def test_actual_f1_local_abandon_releases_exact_candidate_not_shared_provi
     release = adapter.release_media_request
 
     def observed_release(candidate, *, request_options=None):
+        if cleanup != "normal":
+            releases.append((candidate, deepcopy(request_options), False))
+            if cleanup == "raise":
+                raise OSError("private cleanup payload " + rich_images()[1][0])
+            return False
         result = release(candidate, request_options=request_options)
         releases.append((candidate, deepcopy(request_options), result))
         return result
@@ -811,7 +817,7 @@ async def test_actual_f1_local_abandon_releases_exact_candidate_not_shared_provi
             await adapter.request_budget(request, request_options=options, context_estimate=7)
             cancelled.append(True)
         expected = __import__("asyncio").CancelledError if "cancel" in decision else (ValueError, TypeError)
-        with pytest.raises(expected):
+        with pytest.raises(expected) as caught:
             await complete_media_request(
                 adapter, request, options, is_cancelled=lambda: bool(cancelled),
             )
@@ -820,8 +826,17 @@ async def test_actual_f1_local_abandon_releases_exact_candidate_not_shared_provi
         assert releases[0][0] is request and releases[0][1] == options
         # The adapter already releases its candidate on its own witness refusal;
         # a subsequent loop-owned abandon is honestly idempotent False.
-        assert releases[0][2] is (decision != "witness-refusal")
+        assert releases[0][2] is (cleanup == "normal" and decision != "witness-refusal")
+        if cleanup != "normal" and decision != "witness-refusal":
+            # Deliberately failed owner cleanup is unresolved, not reported
+            # drained. Test teardown explicitly reconciles the original object.
+            assert adapter._candidate is not None and adapter._active
+            assert budget_calls[-1].messages
+            assert release(request, request_options=options) is True
         assert not adapter._active and adapter._candidate is None
+        assert not adapter._lifetimes and not adapter._owned_overlays
+        assert all(private.messages == [] for private in budget_calls)
+        assert rich_images()[1][0] not in str(caught.value) + caplog.text
         assert adapter._closed is False
         assert release(request, request_options=options) is False
         # Shared wrapper remains usable for a distinct later request.
