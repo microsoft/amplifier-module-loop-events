@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import json
 import logging
-import math
 from collections.abc import Mapping
 from copy import deepcopy
 
@@ -371,21 +370,45 @@ async def check_final_budget(provider, request, request_options):
         raise TypeError("Media budget is unavailable for this request")
     if result.get("fits") is False:
         raise ValueError("Media request exceeds the provider budget")
-    # Accept the owner's numeric estimate without calling it an exact count.
-    # A malformed or missing cost/limit cannot certify a media fit.
+    # Numeric media fitting requires an actual provider_count association, not
+    # just a small estimate. The owner below binds it to this exact candidate.
     cost = result.get("estimated_input_tokens")
     limit = result.get("input_limit_tokens")
     if (
-        type(cost) not in (int, float) or type(limit) not in (int, float)
-        or not math.isfinite(cost) or not math.isfinite(limit)
+        type(cost) is not int or type(limit) is not int
         or cost < 0 or limit <= 0
     ):
         raise ValueError("Media budget lacks a valid numeric cost and limit")
     if cost > limit:
         raise ValueError("Media request exceeds the provider budget")
     target = result.get("context_token_budget")
-    if target is not None and (type(target) is not int or target < 0):
+    if type(target) is not int or target < 0:
         raise ValueError("Media budget has an invalid context rebuild target")
+    measurement = result.get("measurement")
+    if (
+        not isinstance(measurement, Mapping)
+        or measurement.get("kind") != "provider_count"
+        or not isinstance(measurement.get("source"), str)
+        or not measurement["source"]
+        or type(measurement.get("input_tokens")) is not int
+        or not 0 <= measurement["input_tokens"] <= cost
+    ):
+        raise ValueError("Media budget lacks a valid provider measurement")
+    witness = getattr(provider, "media_budget_witness", None)
+    if not callable(witness):
+        raise TypeError("Media budget requires an owned measured-candidate witness")
+    value = witness(request, request_options=deepcopy(request_options))
+    if inspect.isawaitable(value):
+        value = await value
+    if (
+        not isinstance(value, Mapping)
+        or type(value.get("v")) is not int or value["v"] != 1
+        or value.get("validated") is not True
+        or not isinstance(value.get("projection_digest"), str)
+        or len(value["projection_digest"]) != 64
+        or any(char not in "0123456789abcdef" for char in value["projection_digest"])
+    ):
+        raise ValueError("Media measured-candidate witness is invalid")
 
 
 def estimate_message_text(request):

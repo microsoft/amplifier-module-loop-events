@@ -739,7 +739,11 @@ async def test_actual_f1_owned_warning_only_without_count(foundation, tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("decision", ["over-limit", "malformed", "cancel-before", "cancel-after", "witness-refusal"])
+@pytest.mark.parametrize("decision", [
+    "over-limit", "malformed", "cancel-before", "cancel-after", "witness-refusal",
+    "fractional-estimate", "boolean-measurement", "underreported-estimate",
+    "missing-measurement",
+])
 @pytest.mark.parametrize("cleanup", ["normal", "false", "raise"])
 async def test_actual_f1_local_abandon_releases_exact_candidate_not_shared_provider(
     foundation, tmp_path, decision, cleanup, caplog
@@ -786,10 +790,20 @@ async def test_actual_f1_local_abandon_releases_exact_candidate_not_shared_provi
                 return {"estimated_input_tokens": True, "input_limit_tokens": 100}
             if decision == "witness-refusal":
                 return None
-            return {
+            result = {
                 "estimated_input_tokens": 101 if decision == "over-limit" else 1,
-                "input_limit_tokens": 100,
+                "input_limit_tokens": 100, "context_token_budget": 100,
+                "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 1},
             }
+            if decision == "fractional-estimate":
+                result["estimated_input_tokens"] = 1.5
+            elif decision == "boolean-measurement":
+                result["measurement"]["input_tokens"] = True
+            elif decision == "underreported-estimate":
+                result["measurement"]["input_tokens"] = 1000
+            elif decision == "missing-measurement":
+                result.pop("measurement")
+            return result
 
         async def complete(self, private, **kwargs):
             sends.append(private)

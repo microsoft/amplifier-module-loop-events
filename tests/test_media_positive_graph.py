@@ -67,6 +67,8 @@ class GraphLoader:
     "special-null-echo", "count-mutation", "checkpoint-order",
     "budget-over-limit", "cancel-before-count", "cancel-after-count",
     "preliminary-cancel",
+    "fractional-estimate", "boolean-measurement", "underreported-estimate",
+    "missing-measurement",
 ])
 async def test_public_graph_actual_core_store_checkpoint_count_send(
     foundation, bridge_installer, tmp_path, fmt, limit, case
@@ -162,11 +164,20 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
             if case == "cancel-after-count":
                 core.cancellation.request_graceful()
             cost = 101 if case == "budget-over-limit" else 10
-            return {
+            result = {
                 "estimated_input_tokens": cost, "input_limit_tokens": 100,
                 "context_token_budget": 100,
                 "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": cost},
             }
+            if case == "fractional-estimate":
+                result["estimated_input_tokens"] = 10.5
+            elif case == "boolean-measurement":
+                result["measurement"]["input_tokens"] = True
+            elif case == "underreported-estimate":
+                result["measurement"]["input_tokens"] = 1000
+            elif case == "missing-measurement":
+                result.pop("measurement")
+            return result
 
         async def complete(self, request, **kwargs):
             cap.validate(request, purpose="provider-send", request_options=kwargs)
@@ -236,6 +247,7 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
     # Record canonical calls without replacing the actual provider adapter or
     # bridge emitter/processor identities.
     preparation_failures = []
+    canonical_dispatch_objects = []
 
     async def observe_fallback(request, **kwargs):
         try:
@@ -246,6 +258,7 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
 
 
     async def observe_canonical(request, **kwargs):
+        canonical_dispatch_objects.append(request)
         canonical.append(request.model_dump())
         return await original_complete(request, **kwargs)
 
@@ -264,6 +277,15 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
     )
     original_complete = adapter.complete
     original_fallback = adapter.media_text_fallback_witness
+    original_budget_witness = adapter.media_budget_witness
+    budget_witnesses = []
+
+    def observe_budget_witness(request, *, request_options=None):
+        value = original_budget_witness(request, request_options=request_options)
+        budget_witnesses.append((request, deepcopy(request_options), value))
+        return value
+
+    adapter.media_budget_witness = observe_budget_witness
     release = getattr(adapter, "release_media_request", None)
     releases = []
 
@@ -383,10 +405,18 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
             assert not publications
             assert answer != "done"
             return
-        if case in {"visual-none-budget", "unsupported-none-budget", "count-mutation"}:
+        if case in {
+            "visual-none-budget", "unsupported-none-budget", "count-mutation",
+            "fractional-estimate", "boolean-measurement", "underreported-estimate",
+            "missing-measurement",
+        }:
             assert len(sent) == 1
-            assert len(counted) == (2 if case == "count-mutation" else 1)
+            assert len(counted) == (
+                1 if case in {"visual-none-budget", "unsupported-none-budget"} else 2
+            )
             assert answer != "done"
+            assert adapter._candidate is None and not adapter._active
+            assert not adapter._lifetimes and not adapter._owned_overlays
             if case == "unsupported-none-budget":
                 # The tool-call history contains opaque Core message extras.
                 # F1 owns this refusal; never drop them to manufacture fallback.
@@ -410,6 +440,10 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
             assert counted[-1][1]["tools"] and counted[-1][1]["reasoning_effort"] == "low"
             assert order.index("append") < order.index("checkpoint") < order.index("count")
             assert order[-2:] == ["count", "send"]
+            assert len(budget_witnesses) == 1
+            assert budget_witnesses[0][0] is canonical_dispatch_objects[-1]
+            assert budget_witnesses[0][1] == counted[-1][2]
+            assert budget_witnesses[0][2]["validated"] is True
             outgoing_tool = next(row for row in sent[-1][1]["messages"] if row["role"] == "tool")
             image_blocks = [block for block in outgoing_tool["content"] if block["type"] == "image"]
             if case == "unsupported-none-budget":

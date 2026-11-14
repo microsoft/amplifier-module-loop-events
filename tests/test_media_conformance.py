@@ -132,6 +132,20 @@ class Context:
         return self.messages
 
 
+def measured_budget(cost=1, limit=100, target=100):
+    """Synthetic contract envelope, never actual provider-count evidence."""
+    return {
+        "estimated_input_tokens": cost, "input_limit_tokens": limit,
+        "context_token_budget": target,
+        "measurement": {"kind": "provider_count", "source": "contract-double", "input_tokens": cost},
+    }
+
+
+def measured_witness(request, *, request_options=None):
+    """Structural owner double; actual association is tested with archived F1."""
+    return {"v": 1, "validated": True, "projection_digest": "a" * 64}
+
+
 class Provider:
     def __init__(self, calls=None):
         self.calls = calls or [
@@ -141,10 +155,12 @@ class Provider:
         self.counts = []
 
     async def request_budget(self, messages, *, request_options=None):
-        # Synthetic owner estimate, never an actual provider/image-count claim.
+        # Synthetic owner envelope, never an actual provider/image-count claim.
         value = messages.model_dump() if hasattr(messages, "model_dump") else messages
         self.counts.append(deepcopy(value))
-        return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
+        return measured_budget()
+
+    media_budget_witness = staticmethod(measured_witness)
 
     async def complete(self, request, **kwargs):
         self.requests.append(request.model_dump())
@@ -540,7 +556,7 @@ async def test_host_adapter_owns_private_count_dispatch_projection(limit, vision
                 )
             else:
                 self.count_projections.append(self.project(messages))
-            return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
+            return measured_budget()
 
         async def complete(self, request, **kwargs):
             self.send_projections.append(self.project(request.model_dump()["messages"]))
@@ -1075,7 +1091,7 @@ async def test_media_provider_exception_payload_never_enters_public_diagnostics(
     async def budget(request, *, request_options=None):
         if hasattr(request, "messages") and seam == "count":
             raise ValueError("private input " + PIXELS)
-        return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
+        return measured_budget()
 
     async def complete(request, **kwargs):
         if len(provider.requests) == 1 and seam == "send":
@@ -1122,7 +1138,7 @@ async def test_cancellation_during_final_media_count_prevents_send(limit, kind):
             if kind == "task":
                 raise asyncio.CancelledError()
             coord.cancellation.is_cancelled = True
-        return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
+        return measured_budget()
 
     provider.request_budget = budget
     with pytest.raises(asyncio.CancelledError):
@@ -1167,9 +1183,12 @@ async def test_context_target_not_a_second_provider_budget_ceiling():
         return {
             "estimated_input_tokens": 100000, "input_limit_tokens": 267904,
             "context_token_budget": 80000,
+            "measurement": {"kind": "provider_count", "source": "contract-double", "input_tokens": 100000},
         }
 
-    await check_final_budget(SimpleNamespace(request_budget=budget), request, {})
+    await check_final_budget(SimpleNamespace(
+        request_budget=budget, media_budget_witness=measured_witness,
+    ), request, {})
     assert observed == [(request, {})]
 
 
@@ -1250,3 +1269,85 @@ async def test_local_cancellation_preserved_without_claiming_cleanup(cleanup, ca
         await complete_media_request(provider, request, {}, is_cancelled=lambda: True)
     assert len(calls) == (0 if cleanup == "absent" else 1)
     assert PIXELS not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("outcome", [
+    "valid", "missing", "refusal", "bool-version", "bool-validation", "digest",
+    "cancel",
+])
+async def test_final_numeric_media_requires_exact_owned_measurement_witness(
+    asynchronous, outcome
+):
+    from amplifier_core.message_models import ChatRequest, Message
+
+    from amplifier_module_loop_events._media import complete_media_request
+
+    request = ChatRequest(messages=[Message(
+        role="user", content="observation", metadata={MEDIA: {"refs": [ref("actual")]}},
+    )])
+    options = {"extended_thinking": True}
+    calls, sends, witnesses, releases = [], [], [], []
+    cancelled = []
+
+    async def budget(candidate, *, context_estimate, request_options):
+        assert candidate is request and request_options == options
+        calls.append(candidate)
+        return measured_budget()
+
+    def owner_witness(candidate, *, request_options):
+        assert candidate is request and request_options == options
+        witnesses.append(candidate)
+        if outcome == "refusal":
+            raise ValueError("No measured media budget for this candidate")
+        if outcome == "cancel":
+            cancelled.append(True)
+        value = measured_witness(candidate, request_options=request_options)
+        if outcome == "bool-version":
+            value["v"] = True
+        elif outcome == "bool-validation":
+            value["validated"] = 1
+        elif outcome == "digest":
+            value["projection_digest"] = "not-a-private-projection-digest"
+        return value
+
+    async def async_witness(candidate, *, request_options):
+        return owner_witness(candidate, request_options=request_options)
+
+    async def complete(candidate, **kwargs):
+        assert candidate is request and kwargs == options
+        sends.append(candidate)
+        return "done"
+
+    def release(candidate, *, request_options):
+        assert candidate is request and request_options == options
+        releases.append(candidate)
+        return True
+
+    async def fallback(*args, **kwargs):
+        raise AssertionError("Malformed/refused numeric witnesses cannot downgrade")
+
+    provider = SimpleNamespace(
+        request_budget=budget, complete=complete, release_media_request=release,
+        media_text_fallback_witness=fallback,
+    )
+    if outcome != "missing":
+        provider.media_budget_witness = async_witness if asynchronous else owner_witness
+    if outcome == "valid":
+        assert await complete_media_request(
+            provider, request, options, is_cancelled=lambda: bool(cancelled),
+        ) == "done"
+        assert sends == [request] and not releases
+    else:
+        expected = (
+            asyncio.CancelledError if outcome == "cancel"
+            else TypeError if outcome == "missing" else ValueError
+        )
+        with pytest.raises(expected):
+            await complete_media_request(
+                provider, request, options, is_cancelled=lambda: bool(cancelled),
+            )
+        assert not sends and releases == [request]
+    assert calls == [request]
+    assert len(witnesses) == (0 if outcome == "missing" else 1)
