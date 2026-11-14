@@ -171,7 +171,13 @@ class VerifierControls(unittest.TestCase):
         # JUnit still has the same two allowed source-only skips, but they
         # disagree with the recorded per-node outcomes.
         profile["cases"][-1].remove(profile["cases"][-1].find("skipped"))
-        ET.SubElement(profile["cases"][-3], "skipped", message="swapped")
+        ET.SubElement(profile["cases"][-3], "skipped", message="swapped", type="pytest.skip")
+        verification = runner.reconcile("full", profile["collected"],
+                                        profile["collected"], profile["reports"],
+                                        profile["cases"])
+        self.assertEqual(len(verification["problems"]), 2)
+        self.assertTrue(all(p.startswith("JUnit/typed outcome mismatch:")
+                            for p in verification["problems"]))
         self.assertNotEqual(run_fixture(data), 0)
 
     def test_source_skip_swapped_with_pass_inside_allowed_module(self):
@@ -186,7 +192,13 @@ class VerifierControls(unittest.TestCase):
                                           has_wasxfail=False, wasxfail=None))
         # Same skip count; both JUnit skipped nodes remain in allowed module(s).
         profile["cases"][-3].remove(profile["cases"][-3].find("skipped"))
-        ET.SubElement(profile["cases"][-1], "skipped", message="swapped")
+        ET.SubElement(profile["cases"][-1], "skipped", message="swapped", type="pytest.skip")
+        verification = runner.reconcile("full", profile["collected"],
+                                        profile["collected"], profile["reports"],
+                                        profile["cases"])
+        self.assertEqual(len(verification["problems"]), 2)
+        self.assertTrue(all(p.startswith("JUnit/typed outcome mismatch:")
+                            for p in verification["problems"]))
         self.assertNotEqual(run_fixture(data), 0)
 
 
