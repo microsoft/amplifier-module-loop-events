@@ -1023,3 +1023,21 @@ async def test_prepublication_normalization_or_report_failure_drops_once(failure
     assert not cap.published
     assert len(cap.dropped) == 1
     assert cap.dropped[0][0] == cap.staged["call-1"]
+
+
+@pytest.mark.asyncio
+async def test_text_sibling_does_not_disable_prior_qualified_canonical_media():
+    calls = [
+        SimpleNamespace(id="call-1", name="image", arguments={}),
+        SimpleNamespace(id="call-2", name="text", arguments={}),
+    ]
+    ctx, cap, provider, coord, _, _ = setup(calls=calls)
+    await run(ctx, provider, coord, tools={
+        "image": Tool(), "text": Tool(ToolResult(output="ordinary text")),
+    })
+    first = next(
+        row for row in provider.requests[1]["messages"]
+        if row["role"] == "tool" and row["tool_call_id"] == "call-1"
+    )
+    assert first["metadata"][MEDIA]["refs"] == cap.staged["call-1"]
+    assert tool_messages(ctx)[1]["content"] == "ordinary text"

@@ -536,10 +536,12 @@ class EventDrivenOrchestrator:
                         request_media = None
                         await drop_after_failure(media, staged_data, origin=origin)
                         raise
-                    if not complete:
-                        request_media = None
                     try:
                         effective = normalize_effective(effective)
+                        if not complete and (
+                            refs_from_result(staged_data) or refs_from_result(effective)
+                        ):
+                            request_media = None
                         surviving = (
                             refs_from_result(effective) if complete and checkpoint else []
                         )

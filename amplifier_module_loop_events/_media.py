@@ -149,7 +149,9 @@ async def report_ready(media, *, complete):
 
 async def tool_post(event, *, hooks, coordinator):
     """One host-owned emission/processing, or one unqualified legacy emission."""
-    boundary = post_boundary(coordinator)
+    # Text-only results do not need a media witness. A safe-negative bridge must
+    # not replace their ordinary output with its intentionally unavailable result.
+    boundary = post_boundary(coordinator) if refs_from_result(event.get("result")) else None
     if boundary is not None:
         try:
             outcome = await boundary(event, hooks=hooks, coordinator=coordinator)

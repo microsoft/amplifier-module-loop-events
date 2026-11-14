@@ -24,6 +24,7 @@ from tests.test_media_conformance import (
     Hooks,
     Provider,
     Tool,
+    ref,
     run,
     setup,
     tool_messages,
@@ -165,15 +166,20 @@ def bridge_installer():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["qualified", "safe-negative"])
 @pytest.mark.parametrize("limit", [1, 3])
 @pytest.mark.parametrize("case", [
     "keep", "partial", "missing", "null-injection", "inplace-remove",
-    "inplace-null", "exception", "process-exception", "late-uncovered",
+    "inplace-null", "exception", "process-exception", "late-uncovered", "ordinary-text",
+    "ordinary-error", "text-hook-adds-refs",
 ])
 async def test_actual_bridge_core_registry_store_and_events_end_to_end(
-    foundation, bridge_installer, tmp_path, case, limit
+    foundation, bridge_installer, tmp_path, case, limit, profile
 ):
+    if os.environ.get("AMPLIFIER_MEDIA_BRIDGE_PROFILE") != profile:
+        pytest.skip("this candidate does not qualify the other bridge profile")
     media, checkpoint = foundation
+    text_only = case in {"ordinary-text", "ordinary-error", "text-hook-adds-refs"}
     session = AmplifierSession(
         {"session": {"orchestrator": "fixture", "context": "fixture"}},
         session_id="session-test",
@@ -213,6 +219,12 @@ async def test_actual_bridge_core_registry_store_and_events_end_to_end(
 
     async def handler(event, data):
         posts.append(deepcopy(data))
+        if case == "text-hook-adds-refs":
+            return HookResult(action="modify", data={"result": {
+                "success": True, "output": {
+                    "note": "hook text", MEDIA: {"refs": [ref("unowned")]},
+                },
+            }})
         if case == "partial":
             value = deepcopy(data["result"])
             value["output"][MEDIA]["refs"] = value["output"][MEDIA]["refs"][:1]
@@ -261,12 +273,22 @@ async def test_actual_bridge_core_registry_store_and_events_end_to_end(
 
     coord = CoordinatorObserver()
     result, pixels = rich_images()
+    if text_only:
+        result, pixels = ToolResult(output="ordinary text"), []
+    if case == "ordinary-error":
+        result = ToolResult(
+            success=False, output={"stderr": "useful failure", "returncode": 1},
+            error={"message": "failed"},
+        )
     tool = Tool(result)
     try:
         await run(ctx, provider, coord, HooksObserver(), {"image": tool}, limit=limit)
         assert len(tool.executions) == len(posts) == len(emitted) == len(processed) == 1
-        assert len(publications) == 1
-        expected = 2 if case == "keep" else 1 if case == "partial" else 0
+        assert len(publications) == (0 if text_only else 1)
+        expected = (
+            (2 if case == "keep" else 1 if case == "partial" else 0)
+            if profile == "qualified" else 0
+        )
         message = tool_messages(ctx)[0]
         if expected:
             refs = message["metadata"][MEDIA]["refs"]
@@ -276,20 +298,42 @@ async def test_actual_bridge_core_registry_store_and_events_end_to_end(
                 assert cap.validate(item, purpose="model") == {"valid": True}
         else:
             assert "metadata" not in message
-            assert publications[0][1] == "drop"
+            if not text_only:
+                assert publications[0][1] == "drop"
         assert len(provider.requests) == 2 and saved
-        if case in {"exception", "process-exception", "late-uncovered"}:
+        if profile == "safe-negative" or case in {
+            "exception", "process-exception", "late-uncovered",
+            "ordinary-text", "ordinary-error", "text-hook-adds-refs",
+        }:
             readiness = cap.report("pairing-test", event="readiness", outcome="read")
             assert not readiness["consumers"]
-            if case != "process-exception":
+            if case != "process-exception" and not text_only:
                 assert "Image unavailable" in message["content"]
         else:
             assert "loop-events" in cap.report(
                 "pairing-test", event="readiness", outcome="read"
             )["consumers"]
         if case == "null-injection":
-            assert message["content"] == "null"
+            assert message["content"].startswith("null")
             assert any(m["content"] == "fixture reminder" for m in ctx.messages)
+        if case == "ordinary-text":
+            assert message["content"] == "ordinary text"
+        if case == "ordinary-error":
+            assert posts[0]["result"]["success"] is False
+            assert posts[0]["result"]["error"] == {"message": "failed"}
+            assert json.loads(message["content"]) == {
+                "stderr": "useful failure", "returncode": 1,
+            }
+        if case == "text-hook-adds-refs":
+            assert "hook text" in message["content"]
+            assert "Image unavailable" in message["content"]
+            assert MEDIA not in message["content"]
+        if profile == "safe-negative" and case == "keep":
+            # f943 deliberately supplies no authoritative effective ordinary
+            # result. Preserve explicit null, never reconstruct old useful text.
+            assert message["content"].startswith("null")
+            assert "useful text" not in message["content"]
+            assert "Image unavailable" in message["content"]
         persisted = json.dumps([
             ctx.messages, saved, list(store.journal()), emitted, provider.requests,
         ])
