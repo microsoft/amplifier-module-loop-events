@@ -29,7 +29,7 @@ from ._media import capability
 from ._media import BOUNDARY_UNAVAILABLE
 from ._media import checkpoint_callback
 from ._media import checkpoint_settled
-from ._media import check_final_budget
+from ._media import complete_media_request
 from ._media import drop_staged
 from ._media import drop_after_failure
 from ._media import post_boundary
@@ -208,10 +208,10 @@ class EventDrivenOrchestrator:
                 kwargs = {}
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
-                await check_final_budget(provider, chat_request, kwargs)
-                if coordinator and coordinator.cancellation.is_cancelled:
-                    raise asyncio.CancelledError()
-                response = await provider.complete(chat_request, **kwargs)
+                response = await complete_media_request(
+                    provider, chat_request, kwargs,
+                    is_cancelled=lambda: coordinator is not None and coordinator.cancellation.is_cancelled,
+                )
 
                 # Check for immediate cancellation after provider returns
                 # This allows force-cancel to take effect as soon as the blocking
@@ -662,10 +662,10 @@ DO NOT mention this iteration limit or reminder to the user explicitly. Simply w
                 kwargs = {}
                 if self.extended_thinking:
                     kwargs["extended_thinking"] = True
-                await check_final_budget(provider, max_iter_chat_request, kwargs)
-                if coordinator and coordinator.cancellation.is_cancelled:
-                    raise asyncio.CancelledError()
-                response = await provider.complete(max_iter_chat_request, **kwargs)
+                response = await complete_media_request(
+                    provider, max_iter_chat_request, kwargs,
+                    is_cancelled=lambda: coordinator is not None and coordinator.cancellation.is_cancelled,
+                )
                 tool_calls = provider.parse_tool_calls(response)
 
                 if not tool_calls:

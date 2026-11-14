@@ -1183,3 +1183,70 @@ async def test_ref_request_without_budget_or_owned_fallback_refuses_before_send(
     ctx.get_messages_for_request = messages
     await run(ctx, provider, coord)
     assert len(provider.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 3])
+async def test_cooperative_cancel_before_final_count_has_no_count_or_send(limit):
+    ctx, _, provider, coord, _, _ = setup()
+    counts = []
+
+    async def messages(provider=None):
+        if any(row["role"] == "tool" for row in ctx.messages):
+            coord.cancellation.is_cancelled = True
+        return ctx.messages
+
+    async def budget(request, *, context_estimate, request_options):
+        counts.append(request)
+        raise AssertionError("Cancellation must precede final count")
+
+    ctx.get_messages_for_request = messages
+    provider.request_budget = budget
+    with pytest.raises(asyncio.CancelledError):
+        await run(ctx, provider, coord, limit=limit)
+    assert not counts and len(provider.requests) == 1
+
+
+def test_message_coordinate_estimate_never_counts_refs_pixels_or_tool_schemas():
+    from amplifier_core.message_models import ChatRequest, Message, ToolSpec
+
+    from amplifier_module_loop_events._media import estimate_message_text
+
+    request = ChatRequest(messages=[Message(
+        role="user", content=[
+            {"type": "text", "text": "legitimate local text"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PIXELS}},
+        ], metadata={MEDIA: {"refs": [ref("first")]}},
+    )])
+    estimate = estimate_message_text(request)
+    assert type(estimate) is int and estimate > 0
+    request.messages[0].content[1].source["data"] = "pixel-transport" * 100000
+    request.messages[0].metadata[MEDIA]["refs"] *= 1000
+    request.tools = [ToolSpec(name="large", description="schema" * 100000, parameters={})]
+    assert estimate_message_text(request) == estimate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["false", "error", "absent"])
+async def test_local_cancellation_preserved_without_claiming_cleanup(cleanup, caplog):
+    from amplifier_core.message_models import ChatRequest, Message
+
+    from amplifier_module_loop_events._media import complete_media_request
+
+    calls = []
+    request = ChatRequest(messages=[Message(role="user", content="ordinary text")])
+
+    def release(candidate, *, request_options):
+        assert candidate is request
+        calls.append(request_options)
+        if cleanup == "error":
+            raise ValueError("private cleanup payload " + PIXELS)
+        return False
+
+    provider = SimpleNamespace()
+    if cleanup != "absent":
+        provider.release_media_request = release
+    with pytest.raises(asyncio.CancelledError):
+        await complete_media_request(provider, request, {}, is_cancelled=lambda: True)
+    assert len(calls) == (0 if cleanup == "absent" else 1)
+    assert PIXELS not in caplog.text

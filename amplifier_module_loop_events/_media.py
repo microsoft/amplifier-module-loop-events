@@ -1,13 +1,17 @@
 """Structural media-v1 integration. Storage and private pixels stay with the host."""
 
+import asyncio
 import inspect
 import json
+import logging
 import math
 from collections.abc import Mapping
 from copy import deepcopy
 
 from amplifier_core import ToolResult
 from amplifier_core.models import HookResult
+
+logger = logging.getLogger(__name__)
 
 MEDIA = "experimental.media.v1"
 TOOL_POST_BOUNDARY = "session.media.tool_post"
@@ -347,7 +351,16 @@ async def check_final_budget(provider, request, request_options):
     options_parameter = parameters.get("request_options")
     if options_parameter is None or options_parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
         raise ValueError("Media budget requires named request_options support")
-    result = budget(request, request_options=deepcopy(request_options))
+    kwargs = {"request_options": deepcopy(request_options)}
+    # Providers use this only as a local text-coordinate hint, not an image or
+    # provider count. Core has no public context-estimate getter; use the same
+    # deliberately partial chars/4 convention as the standalone streaming loop.
+    if "context_estimate" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        kwargs["context_estimate"] = estimate_message_text(request)
+    result = budget(request, **kwargs)
     if inspect.isawaitable(result):
         result = await result
     if result is None:
@@ -373,6 +386,52 @@ async def check_final_budget(provider, request, request_options):
     target = result.get("context_token_budget")
     if target is not None and (type(target) is not int or target < 0):
         raise ValueError("Media budget has an invalid context rebuild target")
+
+
+def estimate_message_text(request):
+    """Partial local message-coordinate hint: never pixels, tools or a fit."""
+    tokens = 0
+    for message in request.messages:
+        value = message.model_dump(mode="json", exclude_none=True)
+        metadata = value.get("metadata")
+        if isinstance(metadata, dict):
+            value["metadata"] = {key: item for key, item in metadata.items() if key != MEDIA}
+        content = value.get("content")
+        if isinstance(content, list):
+            value["content"] = [
+                {key: item for key, item in block.items()
+                 if key not in {"source", "image_url", "url", "data", "file_id"}}
+                if isinstance(block, dict) and block.get("type") in {
+                    "image", "image_url", "input_image"
+                } else block
+                for block in content
+            ]
+        tokens += len(str(value)) // 4
+    return tokens
+
+
+async def complete_media_request(provider, request, request_options, *, is_cancelled):
+    """Own the exact final candidate until transport, releasing local refusals."""
+    options = deepcopy(request_options)
+    dispatched = False
+    try:
+        if is_cancelled():
+            raise asyncio.CancelledError()
+        await check_final_budget(provider, request, options)
+        if is_cancelled():
+            raise asyncio.CancelledError()
+        dispatched = True
+        return await provider.complete(request, **options)
+    finally:
+        if not dispatched:
+            release = getattr(provider, "release_media_request", None)
+            if callable(release):
+                try:
+                    # Public synchronous per-candidate abandon, not session close.
+                    # Mismatch/absence is not a claim that another fit was released.
+                    release(request, request_options=options)
+                except Exception:  # noqa: BLE001 - cleanup must not replace the original failure/cancellation
+                    logger.warning("Media candidate cleanup failed; owner reconciliation required")
 
 
 async def check_warning_only_fallback(provider, request, request_options):

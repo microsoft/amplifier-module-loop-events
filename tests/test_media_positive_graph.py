@@ -64,7 +64,8 @@ class GraphLoader:
     "keep", "partial", "null", "missing", "inplace", "string", "deny",
     "error", "outer-redaction", "unknown-observed", "checkpoint-failure",
     "unsupported-none-budget", "visual-none-budget", "continue-null-echo",
-    "special-null-echo", "count-mutation",
+    "special-null-echo", "count-mutation", "checkpoint-order",
+    "budget-over-limit", "cancel-before-count", "cancel-after-count",
 ])
 async def test_public_graph_actual_core_store_checkpoint_count_send(
     foundation, bridge_installer, tmp_path, fmt, limit, case
@@ -97,11 +98,19 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
 
         async def get_messages_for_request(self, provider=None):
             assert provider is adapter
-            if case not in {"unsupported-none-budget", "visual-none-budget"} and any(
+            has_media = any(
                 MEDIA in (row.get("metadata") or {}) for row in self.messages
-            ):
+            )
+            if has_media and case == "cancel-before-count":
+                core.cancellation.request_graceful()
+            if case not in {
+                "unsupported-none-budget", "visual-none-budget", "budget-over-limit",
+                "cancel-before-count", "cancel-after-count",
+            } and has_media:
                 preliminary = ChatRequest(messages=[Message(**row) for row in self.messages])
-                await provider.request_budget(preliminary, request_options={})
+                await provider.request_budget(
+                    preliminary, request_options={}, context_estimate=7
+                )
             return self.messages
 
     context = Context()
@@ -129,7 +138,8 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
                 "positions": [] if case == "unsupported-none-budget" else ["tool"],
             }
 
-        async def request_budget(self, request, *, request_options, context_estimate=0):
+        async def request_budget(self, request, *, request_options, context_estimate):
+            assert type(context_estimate) is int and context_estimate > 0
             cap.validate(request, purpose="provider-count", request_options=request_options)
             counted.append((request, request.model_dump(), deepcopy(request_options)))
             order.append("count")
@@ -137,10 +147,13 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
                 request.messages[-1].content = "changed after measured candidate"
             if case in {"unsupported-none-budget", "visual-none-budget"}:
                 return None
+            if case == "cancel-after-count":
+                core.cancellation.request_graceful()
+            cost = 101 if case == "budget-over-limit" else 10
             return {
-                "estimated_input_tokens": 10, "input_limit_tokens": 100,
+                "estimated_input_tokens": cost, "input_limit_tokens": 100,
                 "context_token_budget": 100,
-                "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 10},
+                "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": cost},
             }
 
         async def complete(self, request, **kwargs):
@@ -149,16 +162,18 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
             order.append("send")
             return SimpleNamespace(
                 content="" if len(sent) == 1 else "done", metadata=None,
-                calls=[{"id": "actual-call", "name": "image", "arguments": {}}]
+                calls=(
+                    [{"id": "actual-call", "name": "image", "arguments": {}}]
+                    + ([{"id": "actual-call-2", "name": "image", "arguments": {}}]
+                       if case == "checkpoint-order" else [])
+                )
                 if len(sent) == 1 else [],
             )
 
         def parse_tool_calls(self, response):
             return response.calls
 
-    adapter = MediaPreparedProvider(
-        Wire(), cap, provider_identity={"provider": "fixture", "account": "fixture", "generation": 1},
-    )
+    adapter = None
     executions = []
 
     class ImageTool:
@@ -172,7 +187,7 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
             executions.append(deepcopy(arguments))
             assert core._tool_dispatch_contexts[asyncio.current_task()][
                 "tool_call_id"
-            ] == "actual-call"
+            ] == ("actual-call-2" if len(executions) == 2 else "actual-call")
             return rich
 
     def policy(event, data):
@@ -208,9 +223,7 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
     })
     # Record canonical calls without replacing the actual provider adapter or
     # bridge emitter/processor identities.
-    original_complete = adapter.complete
     preparation_failures = []
-    original_fallback = adapter.media_text_fallback_witness
 
     async def observe_fallback(request, **kwargs):
         try:
@@ -219,21 +232,39 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
             preparation_failures.append(str(error))
             raise
 
-    adapter.media_text_fallback_witness = observe_fallback
 
     async def observe_canonical(request, **kwargs):
         canonical.append(request.model_dump())
         return await original_complete(request, **kwargs)
 
-    adapter.complete = observe_canonical
     modules = {
         "loop-events": ("orchestrator", orchestrator, None),
         "fixture-context": ("context", context, None),
-        "fixture-provider": ("providers", adapter, "fixture"),
+        "fixture-provider": ("providers", None, "fixture"),
         "fixture-image": ("tools", ImageTool(), "image"),
     }
     core.loader = GraphLoader(modules, policy)
     bridge = bridge_installer(core)
+    adapter = MediaPreparedProvider(
+        Wire(), cap,
+        provider_identity={"provider": "fixture", "account": "fixture", "generation": 1},
+        request_scope=bridge.request_scope,
+    )
+    original_complete = adapter.complete
+    original_fallback = adapter.media_text_fallback_witness
+    release = getattr(adapter, "release_media_request", None)
+    releases = []
+
+    if callable(release):
+        def observe_release(request, *, request_options=None):
+            result = release(request, request_options=request_options)
+            releases.append((request, deepcopy(request_options), result))
+            return result
+
+        adapter.release_media_request = observe_release
+    adapter.complete = observe_canonical
+    adapter.media_text_fallback_witness = observe_fallback
+    modules["fixture-provider"] = ("providers", adapter, "fixture")
     graph = bridge.begin_participating_graph(
         session, owner="events.controlled.graph",
         participants=(*modules, "fixture-hooks", "host.policy"),
@@ -263,11 +294,18 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
         if case == "checkpoint-failure":
             raise OSError("fixture save refused")
         messages = deepcopy(context.messages)
+        if case == "checkpoint-order":
+            # Every ref remains present in its own row, but the saved canonical
+            # sequence is wrong. Membership is not an exact-prefix witness.
+            indices = [index for index, row in enumerate(messages) if row["role"] == "tool"]
+            assert len(indices) == 2
+            first, second = indices
+            messages[first], messages[second] = messages[second], messages[first]
         (tmp_path / "transcript.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in messages)
         )
         ack = checkpoint.acknowledge_legacy_checkpoint(
-            tmp_path, session_id=core.session_id, expected_messages=messages,
+            tmp_path, session_id=core.session_id, expected_messages=context.messages,
         )
         store.acknowledge_checkpoint(ack)
         checkpoints.append(messages)
@@ -276,13 +314,38 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
 
     core.register_capability("session.durable_checkpoint", save)
     try:
-        if case == "checkpoint-failure":
+        if case in {"cancel-before-count", "cancel-after-count", "budget-over-limit"}:
+            if case.startswith("cancel-"):
+                # The real Core 2 Rust session boundary translates the loop's
+                # propagated CancelledError to RuntimeError; direct-loop tests
+                # separately require the original task cancellation unchanged.
+                with pytest.raises(RuntimeError, match="Execution failed: CancelledError"):
+                    await session.execute("Inspect the synthetic observation")
+            else:
+                assert await session.execute("Inspect the synthetic observation") != "done"
+            assert len(sent) == len(executions) == len(posts) == len(publications) == 1
+            assert len(counted) == (0 if case == "cancel-before-count" else 1)
+            assert len(checkpoints) == len(releases) == 1
+            assert releases[0][1] == {"extended_thinking": True}
+            # A pre-count cancel has no cached final candidate to release;
+            # after count, the exact owned candidate really was abandoned.
+            assert releases[0][2] is (case != "cancel-before-count")
+            assert adapter._candidate is None and not adapter._active
+            assert bridge.validate_receipt(receipt)
+            assert not any(value in json.dumps(context.messages) for value in pixels)
+            return
+        if case in {"checkpoint-failure", "checkpoint-order"}:
             with pytest.raises(Exception, match="checkpoint"):
                 await session.execute("Inspect the synthetic observation")
             assert len(sent) == 1
             assert len(counted) == 0
             return
         answer = await session.execute("Inspect the synthetic observation")
+        if case == "unknown-observed":
+            assert not sent and not counted and not executions
+            assert not publications
+            assert answer != "done"
+            return
         if case in {"visual-none-budget", "unsupported-none-budget", "count-mutation"}:
             assert len(sent) == 1
             assert len(counted) == (2 if case == "count-mutation" else 1)
@@ -290,7 +353,7 @@ async def test_public_graph_actual_core_store_checkpoint_count_send(
             if case == "unsupported-none-budget":
                 # The tool-call history contains opaque Core message extras.
                 # F1 owns this refusal; never drop them to manufacture fallback.
-                assert preparation_failures == ["Text fallback cannot omit opaque message state"]
+                assert preparation_failures == ["Text fallback cannot omit request tools or opaque state"]
             return
         assert answer == "done", preparation_failures
         assert len(executions) == len(posts) == len(publications) == 1

@@ -378,9 +378,13 @@ async def test_actual_f1_private_provider_complete_preserves_canonical_state(
         def get_media_request_support(self, **kwargs):
             return {"v": 1, "positions": ["tool"] if vision else []}
 
-        async def request_budget(self, request, *, request_options):
+        async def request_budget(self, request, *, request_options, context_estimate):
             cap.validate(request, purpose="provider-count", request_options=request_options)
-            return {"estimated_input_tokens": 1, "input_limit_tokens": 100}
+            return {
+                "estimated_input_tokens": 1, "input_limit_tokens": 100,
+                "context_token_budget": context_estimate,
+                "measurement": {"kind": "provider_count", "source": "fixture", "input_tokens": 1},
+            }
 
         async def complete(self, request, **kwargs):
             cap.validate(request, purpose="provider-send", request_options=kwargs)
@@ -577,7 +581,8 @@ async def test_actual_f1_final_budget_and_complete_share_full_canonical_candidat
         def get_media_request_support(self, **kwargs):
             return {"v": 1, "positions": ["tool"]}
 
-        async def request_budget(self, request, *, request_options, context_estimate=0):
+        async def request_budget(self, request, *, request_options, context_estimate):
+            assert type(context_estimate) is int and context_estimate > 0
             cap.validate(request, purpose="provider-count", request_options=request_options)
             if preliminary_error and not request.tools:
                 raise ValueError("private preliminary payload " + rich_images()[1][0])
@@ -612,7 +617,7 @@ async def test_actual_f1_final_budget_and_complete_share_full_canonical_candidat
             # Actual context APIs can count a selection before the loop adds
             # tools, reasoning and finalization reminder. It is not dispatch fit.
             preliminary = ChatRequest(messages=[Message(**row) for row in ctx.messages])
-            await provider.request_budget(preliminary, request_options={})
+            await provider.request_budget(preliminary, request_options={}, context_estimate=7)
         return ctx.messages
 
     ctx.get_messages_for_request = messages
@@ -728,6 +733,100 @@ async def test_actual_f1_owned_warning_only_without_count(foundation, tmp_path):
         assert "Image unavailable" in json.dumps(sent)
         assert request.model_dump() == before
         assert not hasattr(adapter, "request_budget")
+    finally:
+        await adapter.aclose()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["over-limit", "malformed", "cancel-before", "cancel-after", "witness-refusal"])
+async def test_actual_f1_local_abandon_releases_exact_candidate_not_shared_provider(
+    foundation, tmp_path, decision
+):
+    from amplifier_foundation.session.media_provider import MediaPreparedProvider
+
+    from amplifier_module_loop_events._media import complete_media_request
+
+    media, checkpoint = foundation
+    if not callable(getattr(MediaPreparedProvider, "release_media_request", None)):
+        pytest.skip("exact public per-candidate abandon API not in selected candidate")
+    store = media.SessionMediaStore(
+        tmp_path / "media", "session-test",
+        policy=media.MediaPolicy(1024 * 1024, 10000, 10),
+        checkpoint_verifier=checkpoint.verified_checkpoint_refs,
+    )
+    cap = media.SessionMediaCapability(store, enabled=True)
+    rich, _ = rich_images()
+    origin = {"kind": "tool", "session_id": "session-test", "id": "actual"}
+    staged = await cap.ingest(rich, source_format="core-tool-result", origin=origin, policy=None)
+    refs = staged["staged_refs"]
+    await cap.publish(refs, origin=origin, disposition="retain")
+    row = {"role": "user", "content": "synthetic image", "metadata": {MEDIA: {"refs": refs}}}
+    (tmp_path / "transcript.jsonl").write_text(json.dumps(row) + "\n")
+    store.acknowledge_checkpoint(checkpoint.acknowledge_legacy_checkpoint(
+        tmp_path, session_id="session-test", expected_messages=[row]
+    ))
+    cancelled, budget_calls, sends, releases = [], [], [], []
+    options = {"temperature": 0.2}
+    request = ChatRequest(messages=[Message(**row)])
+
+    class Wire:
+        default_model = "fixture"
+
+        def get_media_request_support(self, **kwargs):
+            return {"v": 1, "positions": ["user"]}
+
+        async def request_budget(self, private, *, context_estimate, request_options):
+            cap.validate(private, purpose="provider-count", request_options=request_options)
+            budget_calls.append(private)
+            if decision == "cancel-after":
+                cancelled.append(True)
+            if decision == "malformed":
+                return {"estimated_input_tokens": True, "input_limit_tokens": 100}
+            if decision == "witness-refusal":
+                return None
+            return {
+                "estimated_input_tokens": 101 if decision == "over-limit" else 1,
+                "input_limit_tokens": 100,
+            }
+
+        async def complete(self, private, **kwargs):
+            sends.append(private)
+            return "done"
+
+    adapter = MediaPreparedProvider(
+        Wire(), cap,
+        provider_identity={"provider": "fixture", "account": "test", "generation": 1},
+    )
+    release = adapter.release_media_request
+
+    def observed_release(candidate, *, request_options=None):
+        result = release(candidate, request_options=request_options)
+        releases.append((candidate, deepcopy(request_options), result))
+        return result
+
+    adapter.release_media_request = observed_release
+    try:
+        if decision == "cancel-before":
+            await adapter.request_budget(request, request_options=options, context_estimate=7)
+            cancelled.append(True)
+        expected = __import__("asyncio").CancelledError if "cancel" in decision else (ValueError, TypeError)
+        with pytest.raises(expected):
+            await complete_media_request(
+                adapter, request, options, is_cancelled=lambda: bool(cancelled),
+            )
+        assert not sends
+        assert len(releases) == 1
+        assert releases[0][0] is request and releases[0][1] == options
+        # The adapter already releases its candidate on its own witness refusal;
+        # a subsequent loop-owned abandon is honestly idempotent False.
+        assert releases[0][2] is (decision != "witness-refusal")
+        assert not adapter._active and adapter._candidate is None
+        assert adapter._closed is False
+        assert release(request, request_options=options) is False
+        # Shared wrapper remains usable for a distinct later request.
+        plain = ChatRequest(messages=[Message(role="user", content="later text")])
+        assert await adapter.complete(plain) == "done"
     finally:
         await adapter.aclose()
         store.close()
