@@ -6,8 +6,14 @@ from collections.abc import Mapping
 from copy import deepcopy
 
 from amplifier_core import ToolResult
+from amplifier_core.models import HookResult
 
 MEDIA = "experimental.media.v1"
+TOOL_POST_BOUNDARY = "session.media.tool_post"
+BOUNDARY_UNAVAILABLE = (
+    "[Image unavailable: a complete media tool-post boundary is not installed; "
+    "no pixels were sent.]"
+)
 UNAVAILABLE = (
     "[Image unavailable to this session: compatible media handling is not installed; "
     "no pixels were sent.]"
@@ -41,8 +47,16 @@ def checkpoint_callback(coordinator):
     return checkpoint if callable(checkpoint) else None
 
 
+def post_boundary(coordinator):
+    getter = getattr(coordinator, "get_capability", None)
+    boundary = getter(TOOL_POST_BOUNDARY) if callable(getter) else None
+    return boundary if callable(boundary) else None
+
+
 def refs_from_result(value):
     """Only the actual effective ToolResult.output carrier is eligible."""
+    if isinstance(value, ToolResult):
+        value = value.model_dump()
     if not isinstance(value, Mapping) or not isinstance(value.get("output"), Mapping):
         return []
     output = value["output"]
@@ -93,7 +107,11 @@ def without_media(value, reason=UNAVAILABLE):
 
 
 async def stage_result(result, media, origin):
-    if media is not None and isinstance(result, ToolResult):
+    has_media = isinstance(result, ToolResult) and (
+        any(block.type == "image" for block in (result.content or []))
+        or isinstance(result.output, Mapping) and MEDIA in result.output
+    )
+    if media is not None and has_media:
         try:
             staged = await media.ingest(
                 result, source_format="core-tool-result", origin=origin, policy=None
@@ -116,17 +134,67 @@ async def stage_result(result, media, origin):
     return result.model_dump() if hasattr(result, "model_dump") else str(result)
 
 
-async def report_ready(coordinator):
-    media = capability(coordinator)
-    if media is not None:
+async def report_ready(media, *, complete):
+    # Mount-time structural availability is not evidence about the actual chain.
+    if media is not None and complete:
         receipt = media.report(
-            None,
+            "loop-events",
             event="consumer-ready",
             outcome="ready",
             details={"contract": 1, "role": "loop"},
         )
         if inspect.isawaitable(receipt):
             await receipt
+
+
+async def tool_post(event, *, hooks, coordinator):
+    """One host-owned emission/processing, or one unqualified legacy emission."""
+    boundary = post_boundary(coordinator)
+    if boundary is not None:
+        try:
+            outcome = await boundary(event, hooks=hooks, coordinator=coordinator)
+        except Exception:  # noqa: BLE001 - never replay a possibly emitted callback
+            raise ValueError("Media tool-post boundary failed; no replay attempted") from None
+        if not isinstance(outcome, Mapping):
+            raise ValueError("Media tool-post boundary returned an invalid outcome")
+        result = outcome.get("hook_result")
+        if not isinstance(result, HookResult):
+            raise ValueError("Media tool-post boundary did not return a processed HookResult")
+        complete = outcome.get("complete") is True and "result" in outcome
+        # Even explicit null is authoritative. Never recover the original event
+        # after a boundary call: it may have emitted effects before refusing.
+        value = outcome.get("result")
+        if result.action == "deny":
+            value = f"Error: {result.reason or 'Tool result denied'}"
+        return result, value, complete
+    result = await hooks.emit("tool:post", event)
+    if coordinator is not None:
+        result = await coordinator.process_hook_result(
+            result, "tool:post", event["tool_name"]
+        )
+    return result, effective_result(result, event), False
+
+
+async def drop_staged(media, staged_value, surviving, *, origin):
+    if media is None:
+        return
+    staged = refs_from_result(staged_value)
+    dropped = [ref for ref in staged if ref not in surviving]
+    if dropped:
+        try:
+            await media.publish(dropped, origin=origin, disposition="drop")
+        except Exception:  # noqa: BLE001 - do not serialize private store diagnostics
+            raise ValueError("Media staging drop failed; no tool replay attempted") from None
+
+
+async def drop_after_failure(media, staged_value, *, origin):
+    """Cleanup must not replace a pending cancellation with a recoverable error."""
+    try:
+        await drop_staged(media, staged_value, [], origin=origin)
+    except Exception:  # noqa: BLE001 - original failure/cancellation remains authoritative
+        # Unsettled staging stays owner-reconcilable; never claim it was deleted.
+        return False
+    return True
 
 
 def effective_result(post_result, event_data):
@@ -155,7 +223,7 @@ def serialize_result(value, *, modified):
     return str(value)
 
 
-async def settle_result(value, *, media, origin, checkpoint, modified):
+def normalize_effective(value):
     if isinstance(value, ToolResult):
         value = value.model_dump()
     if isinstance(value, Mapping) and any(
@@ -164,13 +232,20 @@ async def settle_result(value, *, media, origin, checkpoint, modified):
     ):
         # A post-hook cannot introduce an un-staged raw rich image into history.
         value = without_media(value)
+    return value
+
+
+async def settle_result(value, *, media, origin, checkpoint, modified, complete):
+    value = normalize_effective(value)
     refs = refs_from_result(value)
     metadata = {}
     if refs:
-        if media is None or checkpoint is None:
+        if media is None or checkpoint is None or not complete:
             value = without_media(
                 value,
-                UNAVAILABLE
+                BOUNDARY_UNAVAILABLE
+                if not complete
+                else UNAVAILABLE
                 if media is None
                 else (
                     "[Image unavailable: durable media checkpoint is not installed; "

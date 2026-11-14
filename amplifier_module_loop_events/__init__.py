@@ -8,6 +8,7 @@ __amplifier_module_type__ = "orchestrator"
 
 import asyncio
 import logging
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +19,6 @@ from amplifier_core.events import ORCHESTRATOR_COMPLETE
 from amplifier_core.events import PROMPT_COMPLETE
 from amplifier_core.events import PROMPT_SUBMIT
 from amplifier_core.events import PROVIDER_ERROR
-from amplifier_core.events import TOOL_POST
 from amplifier_core.events import TOOL_PRE
 from amplifier_core.llm_errors import LLMError
 from amplifier_core.message_models import ChatRequest
@@ -26,13 +26,19 @@ from amplifier_core.message_models import Message
 from amplifier_core.message_models import ToolSpec
 
 from ._media import capability
+from ._media import BOUNDARY_UNAVAILABLE
 from ._media import checkpoint_callback
 from ._media import checkpoint_settled
-from ._media import effective_result
+from ._media import drop_staged
+from ._media import drop_after_failure
+from ._media import post_boundary
+from ._media import normalize_effective
+from ._media import refs_from_result
 from ._media import request_messages
 from ._media import report_ready
 from ._media import settle_result
 from ._media import stage_result
+from ._media import tool_post
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +95,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     config = config or {}
     orchestrator = EventDrivenOrchestrator(config)
     await coordinator.mount("orchestrator", orchestrator)
-    await report_ready(coordinator)
     logger.info("Mounted EventDrivenOrchestrator")
     return
 
@@ -155,6 +160,7 @@ class EventDrivenOrchestrator:
         # The host installs the selected provider adapter. Never hydrate loop-owned
         # ChatRequests: context/checkpoint state must remain canonical refs-only.
         media = capability(coordinator)
+        request_media = media if post_boundary(coordinator) is not None else None
         checkpoint = checkpoint_callback(coordinator)
         iteration = 0
         final_response = ""
@@ -168,7 +174,7 @@ class EventDrivenOrchestrator:
             iteration += 1
 
             # Get messages for LLM request (context handles compaction internally)
-            message_dicts = await request_messages(context, provider, media=media)
+            message_dicts = await request_messages(context, provider, media=request_media)
 
             # Append ephemeral injection from prompt:submit if present (not stored in context)
             if (
@@ -511,6 +517,9 @@ class EventDrivenOrchestrator:
                         "id": tool_call.id,
                     }
                     result_data = await stage_result(result, media, origin)
+                    # Hook callbacks can mutate their input. Keep a refs-only
+                    # staging snapshot so a redaction cannot erase its drop set.
+                    staged_data = deepcopy(result_data)
 
                     # Post-tool hook
                     post_data = {
@@ -519,14 +528,31 @@ class EventDrivenOrchestrator:
                         "tool_input": tool_call.arguments,
                         "result": result_data,
                     }
-                    post_result = await hooks.emit(
-                        TOOL_POST,
-                        post_data,
-                    )
-                    if coordinator:
-                        post_result = await coordinator.process_hook_result(
-                            post_result, "tool:post", tool_name
+                    try:
+                        post_result, effective, complete = await tool_post(
+                            post_data, hooks=hooks, coordinator=coordinator
                         )
+                    except BaseException:
+                        request_media = None
+                        await drop_after_failure(media, staged_data, origin=origin)
+                        raise
+                    if not complete:
+                        request_media = None
+                    try:
+                        effective = normalize_effective(effective)
+                        surviving = (
+                            refs_from_result(effective) if complete and checkpoint else []
+                        )
+                        await report_ready(media, complete=complete)
+                    except BaseException:
+                        request_media = None
+                        await drop_after_failure(media, staged_data, origin=origin)
+                        raise
+                    # F1 publishes exactly one disposition for the whole origin.
+                    # Retain commits the surviving subset and drops removed refs
+                    # internally; only a no-survivor outcome needs an explicit drop.
+                    if not surviving:
+                        await drop_staged(media, staged_data, [], origin=origin)
 
                     # Store ephemeral injection from tool:post for next iteration
                     if (
@@ -545,14 +571,20 @@ class EventDrivenOrchestrator:
                             f"Stored ephemeral injection from tool:post ({tool_name}) for next iteration"
                         )
 
-                    effective = effective_result(post_result, post_data)
                     tool_content, tool_metadata = await settle_result(
                         effective,
                         media=media,
                         origin=origin,
                         checkpoint=checkpoint,
                         modified=post_result.action == "modify",
+                        complete=complete,
                     )
+                    if (
+                        not complete
+                        and refs_from_result(staged_data)
+                        and BOUNDARY_UNAVAILABLE not in tool_content
+                    ):
+                        tool_content += f"\n\n{BOUNDARY_UNAVAILABLE}"
 
                     batch_has_media = batch_has_media or bool(tool_metadata)
                     await context.add_message(
@@ -589,6 +621,10 @@ class EventDrivenOrchestrator:
                                 f"Critical: Failed to add error response for tool_call_id {tool_call.id}: {inner_e}"
                             )
 
+                    if isinstance(e, asyncio.CancelledError):
+                        # A cancelled host boundary may already have emitted.
+                        # Preserve pairing, but never continue to another send.
+                        raise
                     # Continue processing remaining tools - don't let one failure stop all tools
                     continue
 
@@ -622,7 +658,7 @@ class EventDrivenOrchestrator:
             )
 
             # Get one final response with the reminder
-            message_dicts = await request_messages(context, provider, media=media)
+            message_dicts = await request_messages(context, provider, media=request_media)
             message_dicts.append(
                 {
                     "role": "user",

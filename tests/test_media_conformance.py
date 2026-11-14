@@ -13,7 +13,13 @@ from amplifier_core.hooks import HookRegistry
 from amplifier_core.models import HookResult
 
 from amplifier_module_loop_events import EventDrivenOrchestrator, mount
-from amplifier_module_loop_events._media import MEDIA, UNAVAILABLE, MediaCheckpointError
+from amplifier_module_loop_events._media import (
+    MEDIA,
+    TOOL_POST_BOUNDARY,
+    UNAVAILABLE,
+    MediaCheckpointError,
+    effective_result,
+)
 
 PIXELS = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
@@ -63,6 +69,8 @@ class Media:
         self.ingested = []
         self.published = []
         self.staged = {}
+        self.dropped = []
+        self.observations = []
 
     async def ingest(self, value, *, source_format, origin, policy):
         assert isinstance(value, ToolResult)
@@ -81,8 +89,11 @@ class Media:
         }
 
     async def publish(self, refs, *, origin, disposition):
-        assert disposition == "retain"
         assert all(r in self.staged[origin["id"]] for r in refs)
+        if disposition == "drop":
+            self.dropped.append((deepcopy(refs), deepcopy(origin)))
+            return {"refs": [], "publication": {"state": "dropped"}}
+        assert disposition == "retain"
         self.published.append((deepcopy(refs), deepcopy(origin)))
         return {
             "refs": deepcopy(refs),
@@ -99,7 +110,8 @@ class Media:
         raise AssertionError("Loop must not hydrate its canonical request")
 
     def report(self, *args, **kwargs):
-        raise AssertionError("Loop must not manufacture a committed report")
+        assert kwargs["event"] == "consumer-ready"
+        self.observations.append((args, kwargs))
 
 
 class Context:
@@ -185,7 +197,23 @@ def setup(media=True, checkpoint=True, calls=None):
         checkpoints.append(deepcopy(ctx.messages))
         return checkpoint
 
-    capabilities = {MEDIA: cap, "session.durable_checkpoint": save}
+    async def structural_boundary(event, *, hooks, coordinator):
+        # Only the deliberately transparent double is qualified here. Real Core
+        # registry integration is exercised separately with the actual host bridge.
+        result = await hooks.emit("tool:post", event)
+        result = await coordinator.process_hook_result(
+            result, "tool:post", event["tool_name"]
+        )
+        return {
+            "hook_result": result,
+            "result": effective_result(result, event),
+            "complete": isinstance(hooks, Hooks),
+        }
+
+    capabilities = {
+        MEDIA: cap, "session.durable_checkpoint": save,
+        TOOL_POST_BOUNDARY: structural_boundary,
+    }
     coord = SimpleNamespace(
         session_id="session-test",
         get_capability=capabilities.get,
@@ -455,7 +483,8 @@ async def test_real_hook_registry_noop_and_modify_use_same_effective_contract():
 
         hooks.register("tool:post", post)
         await run(ctx, provider, coord, hooks)
-        assert bool(cap.published) is not modify
+        assert not cap.published  # A lossy real registry is never self-qualified.
+        assert not cap.observations
 
 
 @pytest.mark.asyncio
@@ -584,8 +613,8 @@ async def test_text_only_rich_content_survives_missing_capability():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_report", [False, True])
-async def test_mount_reports_consumer_readiness_observation_only(async_report):
-    _, cap, _, coord, _, _ = setup()
+async def test_ready_only_after_complete_processed_boundary_not_mount(async_report):
+    ctx, cap, provider, coord, _, _ = setup()
     observations = []
     mounted = []
 
@@ -602,11 +631,13 @@ async def test_mount_reports_consumer_readiness_observation_only(async_report):
     coord.mount = save_mount
     await mount(coord)
     assert mounted == ["orchestrator"]
-    assert observations == [(None, {
+    assert not observations
+    await run(ctx, provider, coord)
+    assert observations == [("loop-events", {
         "event": "consumer-ready", "outcome": "ready",
         "details": {"contract": 1, "role": "loop"},
     })]
-    assert not cap.ingested and not cap.published
+    assert cap.ingested and cap.published
 
 
 @pytest.mark.asyncio
@@ -688,3 +719,307 @@ async def test_typed_posthook_result_normalized_before_rich_image_fallback():
     assert "metadata" not in message
     assert "Image unavailable" in message["content"]
     assert PIXELS not in json.dumps([ctx.messages, checkpoints, provider.requests])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "modify-missing", "null-then-injection", "inplace-remove", "inplace-null", "exception",
+])
+async def test_real_registry_lossy_posthook_cannot_authorize_media(case):
+    """Core2.0.2 loses these facts; no media may publish on that boundary."""
+    ctx, cap, provider, coord, _, checkpoints = setup()
+    hooks = HookRegistry()
+
+    async def post(event, data):
+        if case == "modify-missing":
+            return HookResult(action="modify", data={})
+        if case == "null-then-injection":
+            return HookResult(action="modify", data={"result": None})
+        if case == "inplace-remove":
+            data["result"]["output"].pop(MEDIA, None)
+        if case == "inplace-null":
+            data["result"] = None
+        if case == "exception":
+            raise RuntimeError("synthetic registry swallowed exception")
+        return HookResult()
+
+    hooks.register("tool:post", post, priority=10)
+    if case == "null-then-injection":
+        async def injection(event, data):
+            return HookResult(
+                action="inject_context", context_injection="notice", ephemeral=True
+            )
+        hooks.register("tool:post", injection, priority=20)
+    tool = Tool()
+    await run(ctx, provider, coord, hooks, tools={"image": tool})
+    assert len(tool.executions) == 1
+    assert not cap.published
+    assert "metadata" not in tool_messages(ctx)[0]
+    assert PIXELS not in json.dumps([ctx.messages, checkpoints, provider.requests])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [None, "redacted", {"note": "replaced"}])
+async def test_real_registry_ordinary_text_replacements_remain_authoritative(replacement):
+    ctx, _, provider, coord, _, _ = setup(media=False)
+    hooks = HookRegistry()
+    seen = []
+
+    async def post(event, data):
+        seen.append(deepcopy(data))
+        return HookResult(action="modify", data={"result": replacement})
+
+    hooks.register("tool:post", post)
+    tool = Tool(ToolResult(output="ordinary text"))
+    await run(ctx, provider, coord, hooks, {"image": tool})
+    assert len(seen) == 1 and len(tool.executions) == 1
+    message = tool_messages(ctx)[0]
+    assert "metadata" not in message
+    assert message["tool_call_id"] == "call-1"
+    assert message["content"] == (
+        replacement if isinstance(replacement, str) else json.dumps(replacement)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 3])
+async def test_missing_boundary_drops_staged_refs_and_preserves_legacy_hooks_once(limit):
+    ctx, cap, provider, coord, capabilities, _ = setup()
+    capabilities.pop(TOOL_POST_BOUNDARY)
+    hooks = HookRegistry()
+    posts = []
+    processed = []
+    prior = coord.process_hook_result
+
+    async def post(event, data):
+        posts.append(deepcopy(data))
+        return HookResult()
+
+    async def process(result, event, name):
+        if event == "tool:post":
+            processed.append(name)
+        return await prior(result, event, name)
+
+    coord.process_hook_result = process
+    hooks.register("tool:post", post)
+    tool = Tool()
+    await run(ctx, provider, coord, hooks, {"image": tool}, limit=limit)
+    assert len(posts) == len(processed) == len(tool.executions) == 1
+    assert not cap.published and not cap.observations
+    assert cap.dropped[0][0] == cap.staged["call-1"]
+    message = tool_messages(ctx)[0]
+    assert "ordinary useful text" in message["content"]
+    assert "Image unavailable" in message["content"]
+    assert "metadata" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "incomplete", "result-missing", "truthy-complete", "raises",
+    "not-mapping", "hook-missing",
+])
+async def test_unqualified_boundary_never_reemits_or_processes_twice(case):
+    ctx, cap, provider, coord, capabilities, _ = setup()
+    hooks = Hooks()
+    emissions = []
+    process_calls = []
+    prior = coord.process_hook_result
+
+    async def process(result, event, name):
+        if event == "tool:post":
+            process_calls.append(name)
+        return await prior(result, event, name)
+
+    coord.process_hook_result = process
+
+    async def boundary(event, *, hooks, coordinator):
+        emissions.append(deepcopy(event))
+        result = await hooks.emit("tool:post", event)
+        result = await coordinator.process_hook_result(
+            result, "tool:post", event["tool_name"]
+        )
+        if case == "raises":
+            raise RuntimeError("private boundary diagnostic " + PIXELS)
+        if case == "not-mapping":
+            return None
+        outcome = {"hook_result": result, "result": event["result"], "complete": True}
+        if case == "incomplete":
+            outcome["complete"] = False
+        if case == "result-missing":
+            outcome.pop("result")
+        if case == "truthy-complete":
+            outcome["complete"] = 1
+        if case == "hook-missing":
+            outcome.pop("hook_result")
+        return outcome
+
+    capabilities[TOOL_POST_BOUNDARY] = boundary
+    tool = Tool()
+    await run(ctx, provider, coord, hooks, {"image": tool})
+    assert len(emissions) == len(process_calls) == len(tool.executions) == 1
+    assert len([e for e, _ in hooks.events if e == "tool:post"]) == 1
+    assert not cap.published and not cap.observations
+    assert cap.dropped[0][0] == cap.staged["call-1"]
+    assert "metadata" not in tool_messages(ctx)[0]
+    assert PIXELS not in json.dumps([ctx.messages, provider.requests])
+
+
+@pytest.mark.asyncio
+async def test_complete_boundary_explicit_null_never_falls_back_to_original():
+    ctx, cap, provider, coord, capabilities, _ = setup()
+    seen = []
+
+    async def boundary(event, *, hooks, coordinator):
+        seen.append((hooks, coordinator))
+        result = await hooks.emit("tool:post", event)
+        result = await coordinator.process_hook_result(
+            result, "tool:post", event["tool_name"]
+        )
+        return {"hook_result": result, "result": None, "complete": True}
+
+    capabilities[TOOL_POST_BOUNDARY] = boundary
+    hooks = Hooks()
+    await run(ctx, provider, coord, hooks)
+    assert seen == [(hooks, coord)]
+    assert not cap.published
+    assert cap.dropped[0][0] == cap.staged["call-1"]
+    assert tool_messages(ctx)[0]["content"] == "null"
+
+
+@pytest.mark.asyncio
+async def test_inplace_removal_keeps_pre_hook_staging_snapshot_for_drop():
+    ctx, cap, provider, coord, _, _ = setup()
+
+    def post(event):
+        event["result"]["output"].pop(MEDIA)
+        return HookResult()
+
+    await run(ctx, provider, coord, Hooks(post=post))
+    assert not cap.published
+    assert cap.dropped[0][0] == cap.staged["call-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_fails", [False, True])
+async def test_cancelled_boundary_drops_staging_preserves_pairing_and_stops_dispatch(drop_fails):
+    ctx, cap, provider, coord, capabilities, _ = setup()
+    emissions = []
+
+    async def boundary(event, *, hooks, coordinator):
+        emissions.append(event["tool_call_id"])
+        await hooks.emit("tool:post", event)
+        raise asyncio.CancelledError()
+
+    capabilities[TOOL_POST_BOUNDARY] = boundary
+    if drop_fails:
+        async def fail_drop(*args, **kwargs):
+            raise OSError("synthetic cleanup failure")
+        cap.publish = fail_drop
+    tool = Tool()
+    with pytest.raises(asyncio.CancelledError):
+        await run(ctx, provider, coord, tools={"image": tool})
+    assert emissions == ["call-1"]
+    assert len(tool.executions) == len(provider.requests) == 1
+    assert not cap.published and not cap.observations
+    if not drop_fails:
+        assert cap.dropped[0][0] == cap.staged["call-1"]
+    assert tool_messages(ctx)[0]["tool_call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_typed_boundary_effective_result_not_dropped_before_retention():
+    ctx, cap, provider, coord, capabilities, _ = setup()
+
+    async def boundary(event, *, hooks, coordinator):
+        result = await hooks.emit("tool:post", event)
+        result = await coordinator.process_hook_result(
+            result, "tool:post", event["tool_name"]
+        )
+        return {
+            "hook_result": result,
+            "result": ToolResult(**event["result"]),
+            "complete": True,
+        }
+
+    capabilities[TOOL_POST_BOUNDARY] = boundary
+    await run(ctx, provider, coord)
+    assert not cap.dropped
+    assert cap.published[0][0] == cap.staged["call-1"]
+    assert tool_messages(ctx)[0]["metadata"][MEDIA]["refs"] == cap.staged["call-1"]
+
+
+@pytest.mark.asyncio
+async def test_boundary_exception_disables_later_inherited_request_media():
+    ctx, cap, provider, coord, capabilities, _ = setup()
+    ctx.messages.append({
+        "role": "user", "content": "prior image",
+        "metadata": {MEDIA: {"refs": [ref("prior")]}},
+    })
+
+    async def boundary(event, *, hooks, coordinator):
+        await hooks.emit("tool:post", event)
+        raise RuntimeError("synthetic boundary failure")
+
+    capabilities[TOOL_POST_BOUNDARY] = boundary
+    await run(ctx, provider, coord)
+    prior = provider.requests[1]["messages"][0]
+    assert MEDIA not in prior["metadata"]
+    assert "Image unavailable" in prior["content"]
+    assert not cap.published
+
+
+@pytest.mark.asyncio
+async def test_raw_image_plus_refs_drop_set_matches_sanitized_effective_result():
+    ctx, cap, provider, coord, _, _ = setup()
+
+    def post(event):
+        value = deepcopy(event["result"])
+        value["content"] = image_result().model_dump()["content"]
+        return HookResult(action="modify", data={"result": value})
+
+    await run(ctx, provider, coord, Hooks(post=post))
+    assert not cap.published
+    assert cap.dropped[0][0] == cap.staged["call-1"]
+    assert "metadata" not in tool_messages(ctx)[0]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_text_does_not_depend_on_media_ingress_enablement():
+    ctx, cap, provider, coord, capabilities, _ = setup()
+    capabilities.pop(TOOL_POST_BOUNDARY)
+
+    async def disabled_ingest(*args, **kwargs):
+        raise AssertionError("Text-only tool result must not need media ingress")
+
+    cap.ingest = disabled_ingest
+    await run(
+        ctx, provider, coord, tools={"image": Tool(ToolResult(output="ordinary text"))}
+    )
+    assert tool_messages(ctx)[0]["content"] == "ordinary text"
+    assert not cap.published and not cap.observations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["malformed-content", "report-error", "report-cancel"])
+async def test_prepublication_normalization_or_report_failure_drops_once(failure):
+    ctx, cap, provider, coord, _, _ = setup()
+    if failure != "malformed-content":
+        def fail_report(*args, **kwargs):
+            if failure == "report-cancel":
+                raise asyncio.CancelledError()
+            raise ValueError("synthetic reporting failure")
+        cap.report = fail_report
+
+    def post(event):
+        if failure == "malformed-content":
+            event["result"]["content"] = 1
+        return HookResult()
+
+    if failure == "report-cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await run(ctx, provider, coord, Hooks(post=post))
+    else:
+        await run(ctx, provider, coord, Hooks(post=post))
+    assert not cap.published
+    assert len(cap.dropped) == 1
+    assert cap.dropped[0][0] == cap.staged["call-1"]
