@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 from amplifier_core import AmplifierSession, ToolResult
+from amplifier_core.hooks import HookRegistry
 from amplifier_core.models import HookResult
 
 from amplifier_module_loop_events._media import MEDIA
@@ -423,3 +424,116 @@ async def test_actual_f1_private_provider_complete_preserves_canonical_state(
     finally:
         await adapter.aclose()
         store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 3])
+@pytest.mark.parametrize("kind", ["rich", "refs", "text", "failure"])
+async def test_actual_disabled_f1_preserves_optional_text_without_media_calls(
+    foundation, kind, limit
+):
+    media, _ = foundation
+    ctx, _, provider, coord, capabilities, _ = setup()
+    touched = []
+
+    class NoIOStore:
+        session_id = coord.session_id
+
+        def __getattr__(self, name):
+            touched.append(name)
+            raise AssertionError("Disabled media must not touch its backing store")
+
+    cap = media.SessionMediaCapability(NoIOStore(), enabled=False)
+    calls = []
+    for name in ("ingest", "publish", "report"):
+        original = getattr(cap, name)
+
+        if name == "report":
+            def report(*args, _original=original, **kwargs):
+                calls.append("report")
+                return _original(*args, **kwargs)
+            cap.report = report
+        else:
+            async def operation(*args, _name=name, _original=original, **kwargs):
+                calls.append(_name)
+                return await _original(*args, **kwargs)
+            setattr(cap, name, operation)
+    capabilities[MEDIA] = cap
+    bridge_calls = []
+
+    async def forbidden_bridge(*args, **kwargs):
+        bridge_calls.append(True)
+        raise AssertionError("Disabled media must use the ordinary sanitized path")
+
+    capabilities["session.media.tool_post"] = forbidden_bridge
+    result, pixels = rich_images()
+    if kind == "refs":
+        result = ToolResult(output={"note": "useful text", MEDIA: {"refs": [ref("old")]}})
+    elif kind == "text":
+        result = ToolResult(output="useful text")
+    elif kind == "failure":
+        result = ToolResult(
+            success=False, output={"note": "useful text", "returncode": 1},
+            error={"message": "actual failure"},
+        )
+    original_result = result.model_dump()
+    posts = []
+    hooks = HookRegistry()
+
+    async def post(event, data):
+        posts.append(deepcopy(data))
+        return HookResult()
+
+    hooks.register("tool:post", post)
+    tool = Tool(result)
+    await run(ctx, provider, coord, hooks, {"image": tool}, limit=limit)
+    assert len(tool.executions) == len(posts) == 1
+    assert not calls and not touched and not bridge_calls
+    assert not cap._consumers
+    assert cap.enabled is False
+    assert result.model_dump() == original_result
+    message = tool_messages(ctx)[0]
+    assert "useful text" in message["content"]
+    assert "Internal error" not in message["content"]
+    assert "metadata" not in message
+    assert posts[0]["result"]["success"] == result.success
+    assert posts[0]["result"]["error"] == result.error
+    if kind in {"rich", "refs"}:
+        assert "Image unavailable" in message["content"]
+        assert MEDIA not in json.dumps(posts)
+        assert "content" not in posts[0]["result"]
+    else:
+        assert "Image unavailable" not in message["content"]
+    if kind == "rich":
+        assert "observation" in message["content"]
+    for value in pixels:
+        assert value not in json.dumps([posts, ctx.messages, provider.requests])
+    assert len(provider.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_enabled_f1_ingest_refusal_is_not_optional_disabled_fallback(foundation):
+    from amplifier_module_loop_events._media import capability, stage_result
+
+    media, _ = foundation
+    _, _, _, coord, capabilities, _ = setup()
+    calls = []
+
+    class RefusingStore:
+        session_id = coord.session_id
+
+        async def ingest(self, *args, **kwargs):
+            calls.append(kwargs)
+            raise media.MediaRefusal("required policy refuses this media")
+
+    cap = media.SessionMediaCapability(RefusingStore(), enabled=True)
+    capabilities[MEDIA] = cap
+    assert capability(coord) is cap
+    result, _ = rich_images()
+    with pytest.raises(ValueError, match="Media staging failed"):
+        await stage_result(result, cap, {
+            "kind": "tool", "session_id": coord.session_id, "id": "actual-call",
+        })
+    assert len(calls) == 1
+    assert calls[0]["policy"] is None
+    assert not cap._consumers

@@ -432,13 +432,15 @@ async def test_async_checkpoint_and_cancellation_preserve_settled_evidence(limit
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", ["capability", "incompatible", "checkpoint"])
+@pytest.mark.parametrize("missing", ["capability", "incompatible", "disabled", "checkpoint"])
 async def test_unavailable_keeps_text_without_base64_or_unsupported_refs(missing):
     ctx, cap, provider, coord, capabilities, _ = setup()
     if missing == "checkpoint":
         capabilities.pop("session.durable_checkpoint")
     elif missing == "incompatible":
         cap.version = 2
+    elif missing == "disabled":
+        cap.enabled = False
     else:
         capabilities.pop(MEDIA)
     hooks = Hooks()
@@ -448,6 +450,8 @@ async def test_unavailable_keeps_text_without_base64_or_unsupported_refs(missing
     assert "Image unavailable" in message["content"]
     assert "metadata" not in message
     assert not cap.published
+    if missing == "disabled":
+        assert not cap.ingested and not cap.observations
     assert PIXELS not in json.dumps([ctx.messages, hooks.events, provider.requests])
 
 

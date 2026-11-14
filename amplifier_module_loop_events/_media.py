@@ -30,6 +30,10 @@ def capability(coordinator):
     if (
         type(getattr(media, "version", None)) is int
         and media.version == 1
+        # An installed neutral/disabled capability is not an ingress grant.
+        # Treat only explicit False as unavailable; older structural consumers
+        # need not expose this optional host-owned activation flag.
+        and getattr(media, "enabled", None) is not False
         and all(
             callable(getattr(media, op, None))
             for op in (
